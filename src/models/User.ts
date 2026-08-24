@@ -8,6 +8,8 @@ export class User extends Model {
   public email!: string;
   public passwordHash!: string;
   public refreshToken!: string | null;
+  public resetPasswordToken!: string | null;
+  public resetPasswordExpiresAt!: Date | null;
   public allowedScreens!: any;
   public deletedAt!: Date | null;
   
@@ -21,6 +23,8 @@ User.init(
     email: { type: DataTypes.STRING, allowNull: false, unique: true },
     passwordHash: { type: DataTypes.STRING, allowNull: false },
     refreshToken: { type: DataTypes.STRING, allowNull: true },
+    resetPasswordToken: { type: DataTypes.STRING, allowNull: true },
+    resetPasswordExpiresAt: { type: DataTypes.DATE, allowNull: true },
     allowedScreens: { type: DataTypes.JSON, allowNull: true, defaultValue: [] },
     deletedAt: { type: DataTypes.DATE, allowNull: true },
   },

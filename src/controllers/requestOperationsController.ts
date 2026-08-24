@@ -1759,11 +1759,13 @@ export const initiateCustomerPayment = async (req: AuthRequest, res: Response) =
     const amount = toMoney(quote.getDataValue('totalAmount'));
     const transactionReference = `RRQ-${requestId}-${Date.now()}`;
     const paymentMethod = req.body.paymentMethod ? String(req.body.paymentMethod).trim() : 'MANUAL_CAPTURE';
+    const isMockFailure = paymentMethod === 'MOCK_FAILURE';
+    const paymentStatus = isMockFailure ? PAYMENT_STATUSES.FAILED : PAYMENT_STATUSES.COMPLETED;
 
     const payment = await PaymentTransaction.create({
       customerRequestId: requestId,
       requestQuoteId: quote.getDataValue('id'),
-      paymentStatus: PAYMENT_STATUSES.COMPLETED,
+      paymentStatus,
       provider: 'ROADRESQ_MANUAL_READY',
       paymentMethod,
       amount,
@@ -1771,26 +1773,32 @@ export const initiateCustomerPayment = async (req: AuthRequest, res: Response) =
       transactionReference,
       gatewayPayload: {
         mode: 'mock-readiness',
+        outcome: isMockFailure ? 'failure' : 'success',
         recordedAt: new Date().toISOString()
       },
-      paidAt: new Date()
+      paidAt: isMockFailure ? null : new Date()
     });
 
     await requestRecord.update({
-      paymentStatus: PAYMENT_STATUSES.COMPLETED,
+      paymentStatus,
       finalAmount: amount
     });
 
     await appendTimelineEvent({
       customerRequestId: requestId,
-      eventType: 'PAYMENT_RECORDED',
+      eventType: isMockFailure ? 'PAYMENT_FAILED' : 'PAYMENT_RECORDED',
       actorType: 'CUSTOMER',
       actorUserId: req.user.userId,
-      notes: `Mock payment readiness recorded for INR ${amount.toFixed(2)} via ${paymentMethod}`,
+      notes: isMockFailure
+        ? `Mock payment failure recorded for INR ${amount.toFixed(2)} via ${paymentMethod}`
+        : `Mock payment readiness recorded for INR ${amount.toFixed(2)} via ${paymentMethod}`,
       metadata: { paymentTransactionId: payment.getDataValue('id'), transactionReference }
     });
 
-    res.json({ message: 'Payment readiness recorded', payment });
+    res.json({
+      message: isMockFailure ? 'Mock payment failure recorded' : 'Payment readiness recorded',
+      payment
+    });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to initiate customer payment');
   }

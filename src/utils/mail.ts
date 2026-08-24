@@ -52,3 +52,45 @@ export const sendOtpEmail = async (email: string, code: string) => {
     throw error;
   }
 };
+
+export const sendPasswordResetEmail = async (email: string, resetUrl: string) => {
+  if (!resend) {
+    console.warn(`Resend API Key is missing. Skipping password reset email to ${email}. Reset link: ${resetUrl}`);
+    return;
+  }
+
+  try {
+    const { error } = await resend.emails.send({
+      from: "RoadResQ <support@roadresq.in>",
+      to: [email],
+      subject: 'Reset Your RoadResQ Password',
+      html: `
+        <div style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f4f5; padding: 40px 20px; text-align: center;">
+          <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 16px; padding: 40px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
+            <h1 style="color: #111827; margin-bottom: 20px; font-size: 24px; font-weight: 800;">Reset your password</h1>
+            <p style="color: #4b5563; font-size: 16px; line-height: 1.5; margin-bottom: 30px;">
+              Click the button below to create a new password for your RoadResQ account.
+            </p>
+            <a href="${resetUrl}" style="display: inline-block; background-color: #2563eb; color: #ffffff; text-decoration: none; font-size: 16px; font-weight: 700; padding: 14px 24px; border-radius: 12px; margin-bottom: 24px;">
+              Reset password
+            </a>
+            <p style="color: #6b7280; font-size: 14px; margin-bottom: 10px;">
+              This link will expire in 1 hour.
+            </p>
+            <p style="color: #9ca3af; font-size: 12px; line-height: 1.5; word-break: break-all;">
+              If the button does not work, use this link:<br />${resetUrl}
+            </p>
+          </div>
+        </div>
+      `,
+    });
+
+    if (error) {
+      console.error('Resend Error:', error);
+      throw error;
+    }
+  } catch (error) {
+    console.error('Failed to send password reset email:', error);
+    throw error;
+  }
+};

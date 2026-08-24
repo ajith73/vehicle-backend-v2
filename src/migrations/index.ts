@@ -1330,6 +1330,27 @@ const createPhaseEightRegionalScaleTablesMigration: Migration = {
   }
 };
 
+const addUserPasswordResetFieldsMigration: Migration = {
+  name: '024-add-user-password-reset-fields',
+  up: async (queryInterface) => {
+    const tableDesc = await queryInterface.describeTable('Users');
+
+    if (!tableDesc.resetPasswordToken) {
+      await queryInterface.addColumn('Users', 'resetPasswordToken', {
+        type: DataTypes.STRING,
+        allowNull: true
+      });
+    }
+
+    if (!tableDesc.resetPasswordExpiresAt) {
+      await queryInterface.addColumn('Users', 'resetPasswordExpiresAt', {
+        type: DataTypes.DATE,
+        allowNull: true
+      });
+    }
+  }
+};
+
 export const migrations: Migration[] = [
   initialSchemaMigration,
   addPincodeMigration,
@@ -1353,7 +1374,8 @@ export const migrations: Migration[] = [
   createPhaseFiveMembershipAndTrustTablesMigration,
   createPhaseSixRealtimeOpsTablesMigration,
   createPhaseSevenAnalyticsTablesMigration,
-  createPhaseEightRegionalScaleTablesMigration
+  createPhaseEightRegionalScaleTablesMigration,
+  addUserPasswordResetFieldsMigration
 ];
 
 export const addCustomerProfilePictureMigration: Migration = {

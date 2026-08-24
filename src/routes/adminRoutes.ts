@@ -107,6 +107,8 @@ adminRoutes.put('/mechanics/bulk/status', superAdminOnly, validateBody(mechanicB
 adminRoutes.get('/mechanics/:id', mechanicController.getMechanicById as any);
 adminRoutes.put('/mechanics/:id', validateBody(mechanicSchema), mechanicController.updateMechanic as any);
 adminRoutes.put('/mechanics/:id/trust-status', validateBody(adminMechanicTrustSchema), mechanicController.updateMechanicTrustStatus as any);
+adminRoutes.post('/mechanics/:id/reset-password', adminOrSuperAdmin, mechanicController.adminResetMechanicPassword as any);
+adminRoutes.put('/mechanics/:id/status', adminOrSuperAdmin, mechanicController.adminUpdateMechanicStatus as any);
 adminRoutes.delete('/mechanics/:id', superAdminOnly, mechanicController.deleteMechanic as any);
 adminRoutes.post('/mechanics/:id/approve', superAdminOnly, mechanicController.approveMechanic as any);
 adminRoutes.put('/mechanics/:id/verification', superAdminOnly, mechanicController.updateVerification as any);

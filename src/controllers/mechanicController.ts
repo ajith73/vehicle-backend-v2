@@ -1,13 +1,44 @@
 import { Response } from 'express';
 import axios from 'axios';
+import bcrypt from 'bcrypt';
 import { Op, col, fn, where as sqlWhere } from 'sequelize';
-import { Mechanic, MechanicUpdateRequest, ActivityLog, TrustedPartnerAudit, User, VerificationRequest } from '../models';
+import { Mechanic, MechanicUpdateRequest, ActivityLog, TrustedPartnerAudit, User, VerificationRequest, Role } from '../models';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { handleControllerError } from '../utils/controller';
 
 export const getMechanics = async (req: AuthRequest, res: Response) => {
   try {
-    const mechanics = await Mechanic.findAll();
+    const registeredOnly = String(req.query.registeredOnly || '').toLowerCase() === 'true';
+    const partnerAccountsOnly = String(req.query.partnerAccountsOnly || '').toLowerCase() === 'true';
+
+    const include = partnerAccountsOnly
+      ? [
+          {
+            model: User,
+            as: 'Creator',
+            required: true,
+            attributes: ['id', 'email'],
+            include: [
+              {
+                model: Role,
+                required: true,
+                where: {
+                  name: {
+                    [Op.in]: ['Mechanic', 'Partner']
+                  }
+                },
+                attributes: ['id', 'name']
+              }
+            ]
+          }
+        ]
+      : undefined;
+
+    const whereClause = registeredOnly || partnerAccountsOnly
+      ? { createdById: { [Op.ne]: null } }
+      : undefined;
+
+    const mechanics = await Mechanic.findAll({ where: whereClause, include });
     res.json(mechanics);
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch mechanics');
@@ -492,12 +523,21 @@ export const deleteMechanic = async (req: AuthRequest, res: Response) => {
     const mechanicId = parseInt(req.params.id as string, 10);
     const mechanic = await Mechanic.findByPk(mechanicId);
     if (!mechanic) return res.status(404).json({ error: 'Mechanic not found' });
+    const createdById = mechanic.getDataValue('createdById');
+
     await mechanic.destroy();
+
+    if (createdById) {
+      const linkedUser = await User.findByPk(createdById);
+      if (linkedUser) {
+        await linkedUser.destroy();
+      }
+    }
     
     await ActivityLog.create({
       userId: req.user?.userId,
       action: 'Deleted Mechanic',
-      details: `Super Admin deleted mechanic ID ${mechanicId}.`
+      details: `Super Admin deleted mechanic ID ${mechanicId}${createdById ? ` and soft-deleted linked user ID ${createdById}` : ''}.`
     });
 
     res.json({ message: 'Mechanic deleted successfully' });
@@ -520,6 +560,84 @@ export const approveMechanic = async (req: AuthRequest, res: Response) => {
     res.json({ message: 'Mechanic approved' });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to approve mechanic');
+  }
+};
+
+export const adminResetMechanicPassword = async (req: AuthRequest, res: Response) => {
+  try {
+    const mechanicId = parseInt(req.params.id as string, 10);
+    if (isNaN(mechanicId)) {
+      return res.status(400).json({ error: 'Invalid mechanic id' });
+    }
+
+    const mechanic = await Mechanic.findByPk(mechanicId);
+    if (!mechanic) {
+      return res.status(404).json({ error: 'Partner not found' });
+    }
+
+    const createdById = mechanic.getDataValue('createdById');
+    if (!createdById) {
+      return res.status(400).json({ error: 'Partner account is not linked to a login user yet' });
+    }
+
+    const user = await User.findByPk(createdById, { paranoid: false });
+    if (!user) {
+      return res.status(404).json({ error: 'Partner login account not found' });
+    }
+
+    const temporaryPassword = `RoadResQ@${Math.random().toString(36).slice(-4)}${Date.now().toString().slice(-4)}`;
+    const passwordHash = await bcrypt.hash(temporaryPassword, 10);
+    await user.update({ passwordHash });
+
+    await ActivityLog.create({
+      userId: req.user?.userId,
+      action: 'Reset Partner Password',
+      details: `Temporary password generated for mechanic ID ${mechanicId}.`
+    });
+
+    res.json({
+      message: 'Partner password reset successfully',
+      temporaryPassword
+    });
+  } catch (error) {
+    handleControllerError(req, res, error, 'Failed to reset partner password');
+  }
+};
+
+export const adminUpdateMechanicStatus = async (req: AuthRequest, res: Response) => {
+  try {
+    const mechanicId = parseInt(req.params.id as string, 10);
+    if (isNaN(mechanicId)) {
+      return res.status(400).json({ error: 'Invalid mechanic id' });
+    }
+
+    const nextStatus = String(req.body.status || '').trim();
+    if (!['Approved', 'Inactive'].includes(nextStatus)) {
+      return res.status(400).json({ error: 'Status must be Approved or Inactive' });
+    }
+
+    const mechanic = await Mechanic.findByPk(mechanicId);
+    if (!mechanic) {
+      return res.status(404).json({ error: 'Partner not found' });
+    }
+
+    await mechanic.update({
+      status: nextStatus,
+      approvedById: nextStatus === 'Approved' ? req.user?.userId : mechanic.getDataValue('approvedById')
+    });
+
+    await ActivityLog.create({
+      userId: req.user?.userId,
+      action: 'Updated Partner Status',
+      details: `Mechanic ID ${mechanicId} updated to status ${nextStatus}.`
+    });
+
+    res.json({
+      message: `Partner marked as ${nextStatus}`,
+      mechanic
+    });
+  } catch (error) {
+    handleControllerError(req, res, error, 'Failed to update partner status');
   }
 };
 

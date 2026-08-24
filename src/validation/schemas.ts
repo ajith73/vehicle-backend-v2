@@ -66,6 +66,18 @@ export const loginSchema = objectField({
   portal: optional(enumField(['CUSTOMER', 'PARTNER', 'ADMIN'] as const))
 });
 
+export const forgotPasswordSchema = objectField({
+  email: stringField({ minLength: 3 }),
+  portal: optional(enumField(['CUSTOMER', 'PARTNER', 'ADMIN'] as const))
+});
+
+export const resetPasswordSchema = objectField({
+  email: stringField({ minLength: 3 }),
+  token: stringField({ minLength: 16 }),
+  newPassword: stringField({ minLength: 6 }),
+  portal: optional(enumField(['CUSTOMER', 'PARTNER', 'ADMIN'] as const))
+});
+
 export const feedbackSubmissionSchema = objectField({
   type: stringField({ minLength: 1 }),
   description: stringField({ minLength: 1 })

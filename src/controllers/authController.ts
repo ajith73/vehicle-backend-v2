@@ -1,9 +1,11 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { User, Role, Mechanic, CustomerProfile, CustomerRequest, CustomerSubscription } from '../models';
 import { logger } from '../lib/logger';
 import { handleControllerError } from '../utils/controller';
+import { sendPasswordResetEmail } from '../utils/mail';
 
 const JWT_SECRET = 'supersecret_mvp_key_change_me_in_prod';
 
@@ -50,6 +52,19 @@ const resolveUserRole = async (user: any) => {
   }
 
   return 'Unknown';
+};
+
+const isReusablePartnerUser = async (user: any) => {
+  if (!user || user.getDataValue('deletedAt')) return false;
+
+  const roleName = (user as any).Role?.name;
+  if (roleName !== 'Mechanic' && roleName !== 'Partner') return false;
+
+  const userId = Number(user.getDataValue('id'));
+  if (!userId) return false;
+
+  const linkedMechanic = await Mechanic.findOne({ where: { createdById: userId } });
+  return !linkedMechanic;
 };
 
 export const login = async (req: Request, res: Response) => {
@@ -146,10 +161,11 @@ export const register = async (req: Request, res: Response) => {
     
     const normalizedMobile = typeof mobile === 'string' ? mobile.replace(/\D/g, '').slice(-10) : null;
 
-    const existingUser = await User.findOne({ where: { email }, paranoid: false });
+    const existingUser = await User.findOne({ where: { email }, paranoid: false, include: [{ model: Role }] });
     const isReRegisteringDeletedUser = Boolean(existingUser?.deletedAt);
+    const isReusingPartnerUser = await isReusablePartnerUser(existingUser);
 
-    if (existingUser && !isReRegisteringDeletedUser) {
+    if (existingUser && !isReRegisteringDeletedUser && !isReusingPartnerUser) {
       return res.status(400).json({ error: 'A user account with this email already exists.' });
     }
 
@@ -171,12 +187,16 @@ export const register = async (req: Request, res: Response) => {
     const randomUsername = email.split('@')[0] + Math.floor(Math.random() * 10000);
 
     let newUser = existingUser;
-    if (existingUser && isReRegisteringDeletedUser) {
-      await existingUser.restore();
+    if (existingUser && (isReRegisteringDeletedUser || isReusingPartnerUser)) {
+      if (isReRegisteringDeletedUser) {
+        await existingUser.restore();
+      }
       await existingUser.update({
         username: existingUser.getDataValue('username') || randomUsername,
         passwordHash,
         refreshToken: null,
+        resetPasswordToken: null,
+        resetPasswordExpiresAt: null,
         allowedScreens: existingUser.getDataValue('allowedScreens') || []
       });
     } else {
@@ -327,5 +347,87 @@ export const updatePassword = async (req: any, res: Response) => {
     res.json({ message: 'Password updated successfully' });
   } catch (error: any) {
     handleControllerError(req, res, error, 'Failed to update password');
+  }
+};
+
+export const forgotPassword = async (req: Request, res: Response) => {
+  try {
+    const { email, portal } = req.body;
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = await User.findOne({
+      where: { email: normalizedEmail },
+      include: [{ model: Role }],
+      paranoid: false
+    });
+
+    if (!user || user.getDataValue('deletedAt')) {
+      return res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+    }
+
+    const userRole = await resolveUserRole(user);
+    if (portal && !roleMatchesPortal(userRole, portal)) {
+      return res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+    await user.update({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpiresAt: expiresAt
+    });
+
+    const appUrl = process.env.FRONTEND_APP_URL || process.env.FRONTEND_URL || 'http://localhost:5173';
+    const loginPath = portal === 'PARTNER' ? '/partner/login' : portal === 'ADMIN' ? '/admin/login' : '/customer/login';
+    const resetUrl = `${appUrl.replace(/\/$/, '')}${loginPath}?action=reset&email=${encodeURIComponent(normalizedEmail)}&token=${encodeURIComponent(rawToken)}`;
+    await sendPasswordResetEmail(normalizedEmail, resetUrl);
+
+    logger.info('password_reset_requested', { requestId: req.requestId, email: normalizedEmail, role: userRole, portal });
+    return res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+  } catch (error: any) {
+    handleControllerError(req, res, error, 'Failed to request password reset');
+  }
+};
+
+export const resetPassword = async (req: Request, res: Response) => {
+  try {
+    const { email, token, newPassword, portal } = req.body;
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    const user = await User.findOne({
+      where: { email: normalizedEmail },
+      include: [{ model: Role }],
+      paranoid: false
+    });
+
+    if (!user || user.getDataValue('deletedAt')) {
+      return res.status(400).json({ error: 'Invalid or expired reset link' });
+    }
+
+    const userRole = await resolveUserRole(user);
+    if (portal && !roleMatchesPortal(userRole, portal)) {
+      return res.status(400).json({ error: 'Invalid or expired reset link' });
+    }
+
+    const storedToken = (user as any).resetPasswordToken;
+    const storedExpiry = (user as any).resetPasswordExpiresAt;
+    if (!storedToken || storedToken !== hashedToken || !storedExpiry || new Date(storedExpiry).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'Invalid or expired reset link' });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await user.update({
+      passwordHash,
+      refreshToken: null,
+      resetPasswordToken: null,
+      resetPasswordExpiresAt: null
+    });
+
+    logger.info('password_reset_completed', { requestId: req.requestId, email: normalizedEmail, role: userRole, portal });
+    return res.json({ message: 'Password reset successfully' });
+  } catch (error: any) {
+    handleControllerError(req, res, error, 'Failed to reset password');
   }
 };

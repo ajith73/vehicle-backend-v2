@@ -36,6 +36,27 @@ const parseFilterValues = (value: unknown) => {
     .filter(Boolean);
 };
 
+const isReusablePartnerUser = async (user: any) => {
+  if (!user || user.getDataValue('deletedAt')) return false;
+
+  const roleName = (user as any).Role?.name;
+  if (roleName !== 'Mechanic' && roleName !== 'Partner') return false;
+
+  const userId = Number(user.getDataValue('id'));
+  if (!userId) return false;
+
+  const linkedMechanic = await Mechanic.findOne({ where: { createdById: userId } });
+  if (linkedMechanic) return false;
+
+  const verificationRequests = await VerificationRequest.findAll();
+  const hasPendingVerification = verificationRequests.some((request: any) => {
+    const submittedUserId = request.submittedData?.__userId;
+    return Number(submittedUserId) === userId && String(request.status || '').toLowerCase() === 'pending';
+  });
+
+  return !hasPendingVerification;
+};
+
 export const getMechanics = async (req: Request, res: Response) => {
   try {
     const { vehicleType, serviceType, vehicle, service, search, lat, lng, radius, limit, page, sort, availability, trustedOnly } = req.query;
@@ -415,7 +436,8 @@ export const checkEmail = async (req: Request, res: Response) => {
           include: [{ model: User, paranoid: false, attributes: ['id', 'deletedAt'] }] as any
         })
       : null;
-    const activeUser = user && !user.getDataValue('deletedAt');
+    const reusablePartnerUser = await isReusablePartnerUser(user);
+    const activeUser = user && !user.getDataValue('deletedAt') && !reusablePartnerUser;
     const activeMobileProfile = mobileProfile && !(mobileProfile as any).User?.deletedAt;
     const existingRole = activeUser ? ((user as any).Role?.name || null) : null;
 
