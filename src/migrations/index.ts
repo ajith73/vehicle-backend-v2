@@ -25,6 +25,28 @@ const createTableIfMissing = async (
   await queryInterface.createTable(tableName, attributes);
 };
 
+const normalizeColumnToVarchar = async (
+  queryInterface: QueryInterface,
+  tableName: string,
+  columnName: string,
+  defaultValue?: string
+) => {
+  const tableDesc = await queryInterface.describeTable(tableName).catch(() => null);
+  if (!tableDesc || !tableDesc[columnName]) {
+    return;
+  }
+
+  await queryInterface.sequelize.query(
+    `ALTER TABLE "${tableName}" ALTER COLUMN "${columnName}" TYPE VARCHAR(255) USING "${columnName}"::text;`
+  );
+
+  if (defaultValue !== undefined) {
+    await queryInterface.sequelize.query(
+      `ALTER TABLE "${tableName}" ALTER COLUMN "${columnName}" SET DEFAULT '${defaultValue}';`
+    );
+  }
+};
+
 const timestamps = {
   createdAt: {
     type: DataTypes.DATE,
@@ -1351,6 +1373,21 @@ const addUserPasswordResetFieldsMigration: Migration = {
   }
 };
 
+const normalizeRequestLifecycleColumnsMigration: Migration = {
+  name: '025-normalize-request-lifecycle-columns',
+  up: async (queryInterface) => {
+    await normalizeColumnToVarchar(queryInterface, 'CustomerRequests', 'status', 'SUBMITTED');
+    await normalizeColumnToVarchar(queryInterface, 'CustomerRequests', 'dispatchStatus');
+    await normalizeColumnToVarchar(queryInterface, 'RequestAssignments', 'status', 'ASSIGNED');
+    await normalizeColumnToVarchar(queryInterface, 'RequestDispatchAttempts', 'attemptStatus');
+
+    await queryInterface.sequelize.query('DROP TYPE IF EXISTS "enum_CustomerRequests_status" CASCADE;');
+    await queryInterface.sequelize.query('DROP TYPE IF EXISTS "enum_CustomerRequests_dispatchStatus" CASCADE;');
+    await queryInterface.sequelize.query('DROP TYPE IF EXISTS "enum_RequestAssignments_status" CASCADE;');
+    await queryInterface.sequelize.query('DROP TYPE IF EXISTS "enum_RequestDispatchAttempts_attemptStatus" CASCADE;');
+  }
+};
+
 export const migrations: Migration[] = [
   initialSchemaMigration,
   addPincodeMigration,
@@ -1375,7 +1412,8 @@ export const migrations: Migration[] = [
   createPhaseSixRealtimeOpsTablesMigration,
   createPhaseSevenAnalyticsTablesMigration,
   createPhaseEightRegionalScaleTablesMigration,
-  addUserPasswordResetFieldsMigration
+  addUserPasswordResetFieldsMigration,
+  normalizeRequestLifecycleColumnsMigration
 ];
 
 export const addCustomerProfilePictureMigration: Migration = {

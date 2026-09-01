@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import { Op } from 'sequelize';
+import { Op, col, fn, literal } from 'sequelize';
 import {
   CustomerProfile,
   CustomerRequest,
@@ -19,6 +19,26 @@ import { AuthRequest } from '../middleware/authMiddleware';
 import { handleControllerError } from '../utils/controller';
 
 const todayDateOnly = () => new Date().toISOString().slice(0, 10);
+const DISPATCH_SCORING_CACHE_TTL_MS = 30 * 1000;
+
+let dispatchScoringCache:
+  | {
+      expiresAt: number;
+      payload: {
+        rules: Record<string, unknown>;
+        generatedAt: string;
+        sampleRequestId: number | null;
+        scores: Array<Record<string, unknown>>;
+      };
+    }
+  | null = null;
+
+let partnerPerformanceCache:
+  | {
+      expiresAt: number;
+      payload: Array<Record<string, unknown>>;
+    }
+  | null = null;
 
 const ratio = (value: number, total: number) => {
   if (!total) return 0;
@@ -58,6 +78,11 @@ const getActiveRules = async () => {
 const normalizeScore = (parts: number[]) => {
   if (parts.length === 0) return 0;
   return Number(parts.reduce((sum, item) => sum + item, 0).toFixed(2));
+};
+
+const toGroupedNumber = (value: unknown) => {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? parsed : 0;
 };
 
 const calculateMechanicScore = async (mechanic: any, requestRecord: any, rules: any) => {
@@ -186,21 +211,118 @@ export const getCustomerFunnelAnalytics = async (req: AuthRequest, res: Response
 
 export const getPartnerPerformanceAnalytics = async (req: AuthRequest, res: Response) => {
   try {
-    const mechanics = await Mechanic.findAll({ where: { status: 'Approved' } });
-    const performanceRows = [];
+    if (partnerPerformanceCache && partnerPerformanceCache.expiresAt > Date.now()) {
+      return res.json(partnerPerformanceCache.payload);
+    }
+
+    const mechanics = await Mechanic.findAll({
+      where: { status: 'Approved' },
+      attributes: ['id', 'businessName', 'name', 'city', 'isTrustedPartner', 'isOnline', 'lastActiveAt']
+    });
+    const performanceRows: Array<Record<string, unknown>> = [];
+    const mechanicIds = mechanics.map((mechanic) => mechanic.getDataValue('id'));
+
+    if (mechanicIds.length === 0) {
+      return res.json([]);
+    }
+
+    const [assignmentRows, requestRows, reviewRows] = await Promise.all([
+      RequestAssignment.findAll({
+        where: { mechanicId: { [Op.in]: mechanicIds } } as any,
+        attributes: ['mechanicId', 'status'],
+        raw: true
+      }),
+      CustomerRequest.findAll({
+        where: { mechanicId: { [Op.in]: mechanicIds } } as any,
+        attributes: ['mechanicId', 'status', 'quoteStatus', 'paymentStatus', 'currentEtaMinutes'],
+        raw: true
+      }),
+      Review.findAll({
+        where: {
+          mechanicId: { [Op.in]: mechanicIds },
+          status: 'Approved'
+        } as any,
+        attributes: ['mechanicId', 'ratingRecommendation'],
+        raw: true
+      })
+    ]);
+
+    const assignmentMap = new Map<number, { dispatchAttempts: number; accepted: number; rejected: number }>();
+    assignmentRows.forEach((row: any) => {
+      const mechanicId = Number(row.mechanicId);
+      const current = assignmentMap.get(mechanicId) || { dispatchAttempts: 0, accepted: 0, rejected: 0 };
+      current.dispatchAttempts += 1;
+      if (row.status === 'ACCEPTED') current.accepted += 1;
+      if (row.status === 'REJECTED_BY_MECHANIC') current.rejected += 1;
+      assignmentMap.set(mechanicId, current);
+    });
+
+    const requestMap = new Map<number, {
+      totalOwnedRequests: number;
+      completed: number;
+      quoteApproved: number;
+      paymentLinked: number;
+      averageEtaMinutes: number | null;
+    }>();
+    requestRows.forEach((row: any) => {
+      const mechanicId = Number(row.mechanicId);
+      const current = requestMap.get(mechanicId) || {
+        totalOwnedRequests: 0,
+        completed: 0,
+        quoteApproved: 0,
+        paymentLinked: 0,
+        averageEtaMinutes: null as number | null
+      };
+      const etaSamples: number[] = Array.isArray((current as any).__etaSamples) ? (current as any).__etaSamples : [];
+
+      current.totalOwnedRequests += 1;
+      if (row.status === 'SERVICE_COMPLETED') current.completed += 1;
+      if (row.quoteStatus === 'QUOTE_APPROVED') current.quoteApproved += 1;
+      if (row.paymentStatus === 'PAYMENT_COMPLETED') current.paymentLinked += 1;
+      if (row.currentEtaMinutes != null && Number.isFinite(Number(row.currentEtaMinutes))) {
+        etaSamples.push(Number(row.currentEtaMinutes));
+      }
+
+      (current as any).__etaSamples = etaSamples;
+      requestMap.set(mechanicId, current);
+    });
+
+    requestMap.forEach((value: any) => {
+      const etaSamples = Array.isArray(value.__etaSamples) ? value.__etaSamples : [];
+      value.averageEtaMinutes = etaSamples.length > 0
+        ? Number((etaSamples.reduce((sum: number, item: number) => sum + item, 0) / etaSamples.length).toFixed(2))
+        : null;
+      delete value.__etaSamples;
+    });
+
+    const reviewMap = new Map<number, { total: number; count: number }>();
+    reviewRows.forEach((row: any) => {
+      const mechanicId = Number(row.mechanicId);
+      const current = reviewMap.get(mechanicId) || { total: 0, count: 0 };
+      current.total += toGroupedNumber(row.ratingRecommendation);
+      current.count += 1;
+      reviewMap.set(mechanicId, current);
+    });
 
     for (const mechanic of mechanics) {
       const mechanicId = mechanic.getDataValue('id');
-      const assignments = await RequestAssignment.findAll({ where: { mechanicId } });
-      const dispatchAttempts = assignments.length;
-      const accepted = assignments.filter((item: any) => item.getDataValue('status') === 'ACCEPTED').length;
-      const rejected = assignments.filter((item: any) => item.getDataValue('status') === 'REJECTED_BY_MECHANIC').length;
-      const completed = await CustomerRequest.count({ where: { mechanicId, status: 'SERVICE_COMPLETED' } });
-      const totalOwnedRequests = await CustomerRequest.count({ where: { mechanicId } });
-      const quoteApproved = await CustomerRequest.count({ where: { mechanicId, quoteStatus: 'QUOTE_APPROVED' } });
-      const paymentLinked = await CustomerRequest.count({ where: { mechanicId, paymentStatus: 'PAYMENT_COMPLETED' } });
-      const reviews = await Review.findAll({ where: { mechanicId, status: 'Approved' }, attributes: ['ratingTimeliness', 'ratingRecommendation'] });
-      const avgEtaMinutes = await CustomerRequest.findAll({ where: { mechanicId }, attributes: ['currentEtaMinutes'] });
+      const assignmentStats = assignmentMap.get(mechanicId) || { dispatchAttempts: 0, accepted: 0, rejected: 0 };
+      const requestStats = requestMap.get(mechanicId) || {
+        totalOwnedRequests: 0,
+        completed: 0,
+        quoteApproved: 0,
+        paymentLinked: 0,
+        averageEtaMinutes: null
+      };
+      const reviewStats = reviewMap.get(mechanicId) || { total: 0, count: 0 };
+      const avgRecommendation = reviewStats.count > 0 ? reviewStats.total / reviewStats.count : 0;
+      const dispatchAttempts = assignmentStats.dispatchAttempts;
+      const accepted = assignmentStats.accepted;
+      const rejected = assignmentStats.rejected;
+      const completed = requestStats.completed;
+      const totalOwnedRequests = requestStats.totalOwnedRequests;
+      const quoteApproved = requestStats.quoteApproved;
+      const paymentLinked = requestStats.paymentLinked;
 
       const onlineHours = mechanic.getDataValue('isOnline') ? 8 : 2;
       const metricPayload = {
@@ -214,20 +336,14 @@ export const getPartnerPerformanceAnalytics = async (req: AuthRequest, res: Resp
         completionRate: ratio(completed, Math.max(totalOwnedRequests, 1)),
         quoteApprovalRate: ratio(quoteApproved, Math.max(totalOwnedRequests, 1)),
         paymentLinkedCompletionRate: ratio(paymentLinked, Math.max(completed, 1)),
-        averageEtaMinutes: avgEtaMinutes.length > 0
-          ? Number((avgEtaMinutes.reduce((sum: number, item: any) => sum + Number(item.getDataValue('currentEtaMinutes') || 0), 0) / avgEtaMinutes.length).toFixed(2))
-          : null,
-        score: Number(((ratio(accepted, dispatchAttempts) * 0.3) + (ratio(completed, Math.max(totalOwnedRequests, 1)) * 0.4) + (ratio(paymentLinked, Math.max(completed, 1)) * 0.2) + ((reviews.length ? reviews.reduce((sum: number, item: any) => sum + Number(item.getDataValue('ratingRecommendation') || 0), 0) / reviews.length * 20 : 60) * 0.1)).toFixed(2)),
+        averageEtaMinutes: requestStats.averageEtaMinutes,
+        score: Number(((ratio(accepted, dispatchAttempts) * 0.3) + (ratio(completed, Math.max(totalOwnedRequests, 1)) * 0.4) + (ratio(paymentLinked, Math.max(completed, 1)) * 0.2) + (((avgRecommendation ? avgRecommendation * 20 : 60)) * 0.1)).toFixed(2)),
         metadata: {
           trusted: mechanic.getDataValue('isTrustedPartner'),
           city: mechanic.getDataValue('city'),
           lastActiveAt: mechanic.getDataValue('lastActiveAt')
         }
       };
-
-      const existing = await PartnerPerformanceMetric.findOne({ where: { mechanicId, metricDate: metricPayload.metricDate } });
-      if (existing) await existing.update(metricPayload);
-      else await PartnerPerformanceMetric.create(metricPayload as any);
 
       performanceRows.push({
         mechanicName: mechanic.getDataValue('businessName') || mechanic.getDataValue('name'),
@@ -237,7 +353,13 @@ export const getPartnerPerformanceAnalytics = async (req: AuthRequest, res: Resp
       });
     }
 
-    res.json(performanceRows.sort((a, b) => b.score - a.score));
+    const payload = performanceRows.sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+    partnerPerformanceCache = {
+      expiresAt: Date.now() + 30 * 1000,
+      payload
+    };
+
+    res.json(payload);
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch partner performance analytics');
   }
@@ -356,6 +478,10 @@ export const getFinancialAnalytics = async (req: AuthRequest, res: Response) => 
 
 export const getDispatchScoring = async (req: AuthRequest, res: Response) => {
   try {
+    if (dispatchScoringCache && dispatchScoringCache.expiresAt > Date.now()) {
+      return res.json(dispatchScoringCache.payload);
+    }
+
     const rules = await getActiveRules();
     const requestRecord = await CustomerRequest.findOne({
       where: { mechanicId: { [Op.ne]: null } } as any,
@@ -364,28 +490,23 @@ export const getDispatchScoring = async (req: AuthRequest, res: Response) => {
     });
 
     const mechanics = await Mechanic.findAll({ where: { status: 'Approved' }, limit: 8, order: [['updatedAt', 'DESC']] });
-    const scores = [];
+    const scores = await Promise.all(
+      mechanics.map((mechanic) => calculateMechanicScore(mechanic, requestRecord || {}, rules))
+    );
 
-    for (const mechanic of mechanics) {
-      const scoreRow = await calculateMechanicScore(mechanic, requestRecord || {}, rules);
-      scores.push(scoreRow);
-      await DispatchScoreSnapshot.create({
-        customerRequestId: requestRecord?.getDataValue('id') || null,
-        mechanicId: mechanic.getDataValue('id'),
-        scoreType: 'MATCH_SCORE',
-        score: scoreRow.score,
-        factors: scoreRow.factors,
-        rules,
-        isActiveRuleSet: false,
-      });
-    }
-
-    res.json({
+    const payload = {
       rules,
       generatedAt: new Date().toISOString(),
       sampleRequestId: requestRecord?.getDataValue('id') || null,
       scores: scores.sort((a, b) => b.score - a.score)
-    });
+    };
+
+    dispatchScoringCache = {
+      expiresAt: Date.now() + DISPATCH_SCORING_CACHE_TTL_MS,
+      payload
+    };
+
+    res.json(payload);
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch dispatch scoring');
   }
@@ -408,6 +529,9 @@ export const updateDispatchScoringRules = async (req: AuthRequest, res: Response
       },
       isActiveRuleSet: true
     });
+
+    dispatchScoringCache = null;
+    partnerPerformanceCache = null;
 
     res.json({ message: 'Dispatch scoring rules updated', rules: record.getDataValue('rules') });
   } catch (error) {

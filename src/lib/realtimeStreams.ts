@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import { getSocketServer, socketRooms } from './socketServer';
 
 type RealtimeMessage = {
   type: string;
@@ -87,6 +88,8 @@ export const emitCustomerRequestUpdate = (customerUserId: number, requestId: num
     type: 'request:update',
     payload,
   });
+
+  getSocketServer()?.to(socketRooms.customerRequestRoom(customerUserId, requestId)).emit('request:update', payload);
 };
 
 export const emitMechanicJobsUpdate = (mechanicId: number, payload: unknown) => {
@@ -94,6 +97,8 @@ export const emitMechanicJobsUpdate = (mechanicId: number, payload: unknown) => 
     type: 'jobs:update',
     payload,
   });
+
+  getSocketServer()?.to(socketRooms.mechanicJobsRoom(mechanicId)).emit('jobs:update', payload);
 };
 
 export const emitMechanicJobDetailUpdate = (mechanicId: number, requestId: number, payload: unknown) => {
@@ -101,4 +106,10 @@ export const emitMechanicJobDetailUpdate = (mechanicId: number, requestId: numbe
     type: 'job:update',
     payload,
   });
+
+  getSocketServer()?.to(socketRooms.mechanicJobDetailRoom(mechanicId, requestId)).emit('job:update', payload);
+};
+
+export const emitSocketRoomEvent = (room: string, event: string, payload: unknown) => {
+  getSocketServer()?.to(room).emit(event, payload);
 };

@@ -27,22 +27,6 @@ const toNumberOrNull = (value: unknown) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const ensureCityConfig = async (cityName: string) => {
-  const normalizedName = normalizeText(cityName);
-  const slug = slugify(normalizedName);
-  let cityConfig = await CityConfig.findOne({ where: { slug } });
-  if (!cityConfig) {
-    cityConfig = await CityConfig.create({
-      cityName: normalizedName,
-      slug,
-      launchState: 'PLANNED',
-      countryName: 'India',
-      rules: {}
-    });
-  }
-  return cityConfig;
-};
-
 const ensureCityConfigInventory = async () => {
   const mechanics = await Mechanic.findAll({
     where: {
@@ -51,13 +35,68 @@ const ensureCityConfigInventory = async () => {
     attributes: ['city', 'state', 'country']
   });
 
-  for (const mechanic of mechanics) {
+  const inventory = new Map<string, { cityName: string; slug: string; stateName: string; countryName: string }>();
+
+  mechanics.forEach((mechanic) => {
     const cityName = normalizeText(mechanic.getDataValue('city'));
-    if (!cityName) continue;
-    const cityConfig = await ensureCityConfig(cityName);
+    if (!cityName) return;
+
+    const slug = slugify(cityName);
+    const existing = inventory.get(slug);
+    inventory.set(slug, {
+      cityName,
+      slug,
+      stateName: existing?.stateName || normalizeText(mechanic.getDataValue('state')),
+      countryName: existing?.countryName || normalizeText(mechanic.getDataValue('country')) || 'India'
+    });
+  });
+
+  if (inventory.size === 0) {
+    return;
+  }
+
+  const slugs = Array.from(inventory.keys());
+  const existingConfigs = await CityConfig.findAll({
+    where: {
+      slug: {
+        [Op.in]: slugs
+      }
+    } as any
+  });
+  const existingBySlug = new Map(existingConfigs.map((config) => [String(config.getDataValue('slug')), config]));
+
+  const missingConfigs = Array.from(inventory.values())
+    .filter((item) => !existingBySlug.has(item.slug))
+    .map((item) => ({
+      cityName: item.cityName,
+      slug: item.slug,
+      stateName: item.stateName || null,
+      countryName: item.countryName || 'India',
+      launchState: 'PLANNED',
+      rules: {}
+    }));
+
+  if (missingConfigs.length > 0) {
+    await CityConfig.bulkCreate(missingConfigs as any[]);
+    const refreshedConfigs = await CityConfig.findAll({
+      where: {
+        slug: {
+          [Op.in]: slugs
+        }
+      } as any
+    });
+    refreshedConfigs.forEach((config) => {
+      existingBySlug.set(String(config.getDataValue('slug')), config);
+    });
+  }
+
+  for (const [slug, item] of inventory.entries()) {
+    const cityConfig = existingBySlug.get(slug);
+    if (!cityConfig) continue;
+
     const updates: Record<string, unknown> = {};
-    if (!cityConfig.getDataValue('stateName') && mechanic.getDataValue('state')) updates.stateName = mechanic.getDataValue('state');
-    if (!cityConfig.getDataValue('countryName') && mechanic.getDataValue('country')) updates.countryName = mechanic.getDataValue('country');
+    if (!cityConfig.getDataValue('stateName') && item.stateName) updates.stateName = item.stateName;
+    if (!cityConfig.getDataValue('countryName') && item.countryName) updates.countryName = item.countryName;
     if (Object.keys(updates).length > 0) {
       await cityConfig.update(updates);
     }

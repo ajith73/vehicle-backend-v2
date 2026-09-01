@@ -4,6 +4,19 @@ import { ActivityLog, CustomerProfile, CustomerRequest, DispatchOverride, Mechan
 import { AuthRequest } from '../middleware/authMiddleware';
 import { handleControllerError } from '../utils/controller';
 import { PAYMENT_STATUSES, QUOTE_STATUSES, REQUEST_STATUSES } from '../constants/requestLifecycle';
+import {
+  getAdminLiveMechanicsSnapshot,
+  getAdminLiveRequestsSnapshot,
+  getAdminSupportTicketsSnapshot,
+  getMechanicNotificationsSnapshot,
+  getMechanicSupportTicketsSnapshot,
+  pushAdminSupportTicketsSnapshot,
+  pushAffectedRequestSideSnapshots,
+  pushCustomerNotificationsSnapshot,
+  pushCustomerSupportTicketsSnapshot,
+  pushMechanicNotificationsSnapshot,
+  pushMechanicSupportTicketsSnapshot
+} from '../lib/realtimeSnapshotService';
 
 const MECHANIC_RESPONSE_STATUSES = new Set([
   REQUEST_STATUSES.ACCEPTED,
@@ -132,6 +145,11 @@ const appendRealtimeEvent = async (args: {
     const { pushMechanicSnapshots } = require('./realtimeController');
     await pushMechanicSnapshots(args.mechanicId, args.customerRequestId ?? null);
   }
+
+  await pushAffectedRequestSideSnapshots({
+    customerRequestId: args.customerRequestId ?? null,
+    mechanicId: args.mechanicId ?? null
+  });
 };
 
 const toRadians = (value: number) => (value * Math.PI) / 180;
@@ -644,73 +662,7 @@ export const listMechanicNotifications = async (req: AuthRequest, res: Response)
       return res.status(404).json({ error: 'Mechanic profile not found for this account' });
     }
 
-    const mechanicId = mechanic.getDataValue('id');
-    const [requests, tickets, settlements] = await Promise.all([
-      CustomerRequest.findAll({
-        where: { mechanicId } as any,
-        attributes: ['id', 'status', 'issueSummary', 'updatedAt', 'createdAt', 'dispatchStatus'],
-        order: [['updatedAt', 'DESC']],
-        limit: 12
-      }),
-      SupportTicket.findAll({
-        where: {
-          [Op.or]: [
-            { raisedByUserId: req.user.userId },
-            { source: 'PARTNER' }
-          ]
-        } as any,
-        include: [{ model: CustomerRequest, attributes: ['id', 'mechanicId'] }],
-        order: [['updatedAt', 'DESC']],
-        limit: 12
-      }),
-      PayoutSettlement.findAll({
-        where: { mechanicId } as any,
-        attributes: ['id', 'status', 'totalAmount', 'processedAt', 'createdAt', 'notes'],
-        order: [['createdAt', 'DESC']],
-        limit: 8
-      })
-    ]);
-
-    const requestNotifications = requests.map((request: any) => ({
-      id: `request-${request.getDataValue('id')}-${request.getDataValue('updatedAt')}`,
-      type: ['ASSIGNED', 'ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'SERVICE_STARTED'].includes(String(request.getDataValue('status'))) ? 'ALERT' : 'SYSTEM',
-      title: `Request ${String(request.getDataValue('status')).replace(/_/g, ' ')}`,
-      message: `REQ-${request.getDataValue('id')} • ${request.getDataValue('issueSummary') || 'Roadside request'} is now ${String(request.getDataValue('status')).replace(/_/g, ' ').toLowerCase()}.`,
-      time: request.getDataValue('updatedAt') || request.getDataValue('createdAt'),
-      read: false,
-      source: 'request'
-    }));
-
-    const supportNotifications = tickets
-      .filter((ticket: any) => {
-        const request = ticket.getDataValue('CustomerRequest');
-        return !request || Number(request.mechanicId) === mechanicId || Number(ticket.getDataValue('raisedByUserId')) === req.user?.userId;
-      })
-      .map((ticket: any) => ({
-        id: `support-${ticket.getDataValue('id')}-${ticket.getDataValue('updatedAt')}`,
-        type: ticket.getDataValue('status') === 'RESOLVED' ? 'SUCCESS' : (ticket.getDataValue('priority') === 'CRITICAL' ? 'WARNING' : 'SYSTEM'),
-        title: ticket.getDataValue('status') === 'RESOLVED' ? 'Support ticket resolved' : `Support ${ticket.getDataValue('status').toLowerCase()}`,
-        message: `${ticket.getDataValue('subject')} • ${ticket.getDataValue('priority')} priority`,
-        time: ticket.getDataValue('updatedAt') || ticket.getDataValue('createdAt'),
-        read: false,
-        source: 'support'
-      }));
-
-    const settlementNotifications = settlements.map((settlement: any) => ({
-      id: `settlement-${settlement.getDataValue('id')}-${settlement.getDataValue('createdAt')}`,
-      type: settlement.getDataValue('status') === 'PROCESSED' ? 'SUCCESS' : 'SYSTEM',
-      title: settlement.getDataValue('status') === 'PROCESSED' ? 'Settlement processed' : 'Settlement update',
-      message: `Settlement #${settlement.getDataValue('id')} • INR ${Number(settlement.getDataValue('totalAmount') || 0).toFixed(2)} • ${settlement.getDataValue('status')}`,
-      time: settlement.getDataValue('processedAt') || settlement.getDataValue('createdAt'),
-      read: false,
-      source: 'settlement'
-    }));
-
-    const notifications = [...requestNotifications, ...supportNotifications, ...settlementNotifications]
-      .sort((left, right) => new Date(String(right.time)).getTime() - new Date(String(left.time)).getTime())
-      .slice(0, 30);
-
-    res.json(notifications);
+    res.json(await getMechanicNotificationsSnapshot(Number(mechanic.getDataValue('id')), req.user.userId));
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch mechanic notifications');
   }
@@ -727,30 +679,7 @@ export const listMechanicSupportTickets = async (req: AuthRequest, res: Response
       return res.status(404).json({ error: 'Mechanic profile not found for this account' });
     }
 
-    const tickets = await SupportTicket.findAll({
-      where: {
-        [Op.or]: [
-          { raisedByUserId: req.user.userId },
-          { source: 'PARTNER' }
-        ]
-      } as any,
-      include: [
-        {
-          model: CustomerRequest,
-          attributes: ['id', 'mechanicId', 'status', 'issueSummary', 'addressText']
-        },
-        { model: User, as: 'RaisedByUser', attributes: ['id', 'email', 'name'] },
-        { model: User, as: 'AssignedToUser', attributes: ['id', 'email', 'name'] }
-      ],
-      order: [['createdAt', 'DESC']]
-    });
-
-    const filtered = tickets.filter((ticket: any) => {
-      const request = ticket.getDataValue('CustomerRequest');
-      return !request || Number(request.mechanicId) === mechanic.getDataValue('id') || Number(ticket.getDataValue('raisedByUserId')) === req.user?.userId;
-    });
-
-    res.json(filtered);
+    res.json(await getMechanicSupportTicketsSnapshot(Number(mechanic.getDataValue('id')), req.user.userId));
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch mechanic support tickets');
   }
@@ -825,6 +754,16 @@ export const createMechanicSupportTicket = async (req: AuthRequest, res: Respons
       ]
     });
 
+    await Promise.all([
+      pushMechanicSupportTicketsSnapshot(Number(mechanic.getDataValue('id')), req.user.userId),
+      pushMechanicNotificationsSnapshot(Number(mechanic.getDataValue('id')), req.user.userId),
+      pushAdminSupportTicketsSnapshot(),
+      pushAffectedRequestSideSnapshots({
+        customerRequestId: requestId,
+        mechanicId: Number(mechanic.getDataValue('id'))
+      })
+    ]);
+
     res.status(201).json({ message: 'Support ticket created', ticket: populated });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to create mechanic support ticket');
@@ -847,6 +786,10 @@ const handleMechanicJobDecision = async (req: AuthRequest, res: Response, decisi
       return res.status(404).json({ error: 'Mechanic profile not found for this account' });
     }
 
+    const requestBody = (req.body && typeof req.body === 'object') ? req.body as Record<string, unknown> : {};
+    const decisionReason = String(requestBody.reason || '').trim();
+    const decisionNotes = String(requestBody.notes || '').trim();
+
     const requestRecord = await CustomerRequest.findByPk(requestId);
     if (!requestRecord || requestRecord.getDataValue('mechanicId') !== mechanic.getDataValue('id')) {
       return res.status(404).json({ error: 'Job not found' });
@@ -866,13 +809,12 @@ const handleMechanicJobDecision = async (req: AuthRequest, res: Response, decisi
       await latestAssignment.update({
         status: decision === 'accept' ? REQUEST_STATUSES.ACCEPTED : REQUEST_STATUSES.REJECTED_BY_MECHANIC,
         respondedAt: new Date(),
-        notes: req.body.reason || req.body.notes || latestAssignment.getDataValue('notes') || null
+        notes: decisionReason || decisionNotes || latestAssignment.getDataValue('notes') || null
       });
     }
 
     if (decision === 'reject') {
-      const reason = String(req.body.reason || '').trim();
-      if (!reason) {
+      if (!decisionReason) {
         return res.status(400).json({ error: 'Rejection reason is required' });
       }
     }
@@ -883,7 +825,7 @@ const handleMechanicJobDecision = async (req: AuthRequest, res: Response, decisi
     await updateLatestDispatchAttempt(requestId, mechanic.getDataValue('id'), {
       attemptStatus: decision === 'accept' ? 'PARTNER_ACCEPTED' : 'PARTNER_DECLINED',
       responseAt: new Date(),
-      notes: decision === 'reject' ? String(req.body.reason || '').trim() : 'Mechanic accepted the request.'
+      notes: decision === 'reject' ? decisionReason : 'Mechanic accepted the request.'
     });
 
     await requestRecord.update({
@@ -897,8 +839,8 @@ const handleMechanicJobDecision = async (req: AuthRequest, res: Response, decisi
       actorType: 'MECHANIC',
       actorUserId: req.user.userId,
       eventType: decision === 'accept' ? 'REQUEST_ACCEPTED' : 'REQUEST_REJECTED',
-      notes: decision === 'accept' ? 'Mechanic accepted the assignment.' : String(req.body.reason || '').trim(),
-      metadata: decision === 'reject' ? { reason: String(req.body.reason || '').trim() } : {}
+      notes: decision === 'accept' ? 'Mechanic accepted the assignment.' : decisionReason,
+      metadata: decision === 'reject' ? { reason: decisionReason } : {}
     });
 
     if (decision === 'accept') {
@@ -921,7 +863,7 @@ const handleMechanicJobDecision = async (req: AuthRequest, res: Response, decisi
       actorUserId: req.user.userId,
       channel: 'MECHANIC_DISPATCH',
       eventType: decision === 'accept' ? 'PARTNER_ACCEPTED' : 'PARTNER_DECLINED',
-      payload: { etaMinutes, reason: req.body.reason || null }
+      payload: { etaMinutes, reason: decisionReason || null }
     });
 
     const enriched = await loadRequestForOps(requestId);
@@ -1304,41 +1246,7 @@ export const updateMechanicLiveLocation = async (req: AuthRequest, res: Response
 
 export const listAdminLiveRequests = async (req: AuthRequest, res: Response) => {
   try {
-    const requests = await CustomerRequest.findAll({
-      where: {
-        status: {
-          [Op.in]: [
-            REQUEST_STATUSES.SUBMITTED,
-            REQUEST_STATUSES.UNDER_REVIEW,
-            REQUEST_STATUSES.ASSIGNED,
-            REQUEST_STATUSES.ACCEPTED,
-            REQUEST_STATUSES.EN_ROUTE,
-            REQUEST_STATUSES.ARRIVED,
-            REQUEST_STATUSES.SERVICE_STARTED,
-            REQUEST_STATUSES.NO_RESPONSE,
-            REQUEST_STATUSES.REJECTED_BY_MECHANIC
-          ]
-        }
-      } as any,
-      include: [
-        {
-          model: Mechanic,
-          attributes: ['id', 'businessName', 'name', 'city', 'state', 'isOnline', 'availabilityState', 'lastActiveAt']
-        },
-        { model: ServiceType, attributes: ['id', 'name'] },
-        { model: RequestDispatchAttempt, include: [{ model: Mechanic, attributes: ['id', 'businessName', 'name'] }] },
-        { model: SupportTicket },
-        {
-          model: User,
-          as: 'CustomerUser',
-          attributes: ['id', 'email'],
-          include: [{ model: CustomerProfile, attributes: ['displayName'] }]
-        }
-      ],
-      order: [['updatedAt', 'DESC']]
-    });
-
-    res.json(requests);
+    res.json(await getAdminLiveRequestsSnapshot());
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch live requests');
   }
@@ -1346,15 +1254,7 @@ export const listAdminLiveRequests = async (req: AuthRequest, res: Response) => 
 
 export const listAdminLiveMechanics = async (req: AuthRequest, res: Response) => {
   try {
-    const mechanics = await Mechanic.findAll({
-      where: {
-        status: 'Approved'
-      },
-      include: [{ model: MechanicLiveState }],
-      order: [['updatedAt', 'DESC']]
-    });
-
-    res.json(mechanics);
+    res.json(await getAdminLiveMechanicsSnapshot());
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch live mechanics');
   }
@@ -1866,27 +1766,7 @@ export const listAdminPaymentIssues = async (req: AuthRequest, res: Response) =>
 
 export const listAdminSupportTickets = async (req: AuthRequest, res: Response) => {
   try {
-    const tickets = await SupportTicket.findAll({
-      include: [
-        {
-          model: CustomerRequest,
-          include: [
-            { model: Mechanic, attributes: ['id', 'businessName', 'name'] },
-            {
-              model: User,
-              as: 'CustomerUser',
-              attributes: ['id', 'email'],
-              include: [{ model: CustomerProfile, attributes: ['displayName'] }]
-            }
-          ]
-        },
-        { model: User, as: 'RaisedByUser', attributes: ['id', 'email', 'name'] },
-        { model: User, as: 'AssignedToUser', attributes: ['id', 'email', 'name'] }
-      ],
-      order: [['createdAt', 'DESC']]
-    });
-
-    res.json(tickets);
+    res.json(await getAdminSupportTicketsSnapshot());
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch support tickets');
   }
@@ -1940,6 +1820,37 @@ export const updateAdminSupportTicket = async (req: AuthRequest, res: Response) 
         { model: User, as: 'AssignedToUser', attributes: ['id', 'email', 'name'] }
       ]
     });
+
+    const linkedRequest = refreshed?.getDataValue('CustomerRequest');
+    const mechanicId = linkedRequest ? Number(linkedRequest.mechanicId || 0) : 0;
+    const customerUserId = linkedRequest?.CustomerUser ? Number(linkedRequest.CustomerUser.id || 0) : 0;
+
+    const mechanicRealtimeRefresh = async () => {
+      if (!(mechanicId > 0 && linkedRequest)) {
+        return;
+      }
+
+      const mechanic = await Mechanic.findByPk(mechanicId, { attributes: ['id', 'createdById'] });
+      if (!mechanic) {
+        return;
+      }
+
+      await Promise.all([
+        pushMechanicSupportTicketsSnapshot(mechanicId, Number(mechanic.getDataValue('createdById'))),
+        pushMechanicNotificationsSnapshot(mechanicId, Number(mechanic.getDataValue('createdById')))
+      ]);
+    };
+
+    await Promise.all([
+      pushAdminSupportTicketsSnapshot(),
+      customerUserId > 0 ? pushCustomerSupportTicketsSnapshot(customerUserId) : Promise.resolve(),
+      customerUserId > 0 ? pushCustomerNotificationsSnapshot(customerUserId) : Promise.resolve(),
+      mechanicRealtimeRefresh(),
+      linkedRequest ? pushAffectedRequestSideSnapshots({
+        customerRequestId: Number(linkedRequest.id || 0),
+        mechanicId: mechanicId || null
+      }) : Promise.resolve()
+    ]);
 
     res.json({ message: 'Support ticket updated', ticket: refreshed });
   } catch (error) {

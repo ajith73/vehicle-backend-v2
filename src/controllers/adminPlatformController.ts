@@ -1,4 +1,4 @@
-import { Op } from 'sequelize';
+import { Op, fn, col, literal } from 'sequelize';
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import {
@@ -31,86 +31,152 @@ const hoursAgo = (value: number) => {
   return date;
 };
 
+const AUTOMATION_OVERVIEW_CACHE_TTL_MS = 30 * 1000;
+
+let automationOverviewCache:
+  | {
+      expiresAt: number;
+      payload: {
+        generatedAt: string;
+        metrics: Record<string, number>;
+        recentSignals: Array<{ label: string; value: number; tone: string }>;
+      };
+    }
+  | null = null;
+
 export const getAdminAutomationOverview = async (req: AuthRequest, res: Response) => {
   try {
+    if (automationOverviewCache && automationOverviewCache.expiresAt > Date.now()) {
+      return res.json(automationOverviewCache.payload);
+    }
+
+    const oneHourAgo = hoursAgo(1);
+    const fortyEightHoursAgo = hoursAgo(48);
+    const oneDayAgo = hoursAgo(24);
+
     const [
-      requests,
-      supportTickets,
-      settlements,
-      paymentFailures,
+      partnerMatching,
+      noPartnerFound,
+      partnerCancellation,
+      customerCancellation,
+      partnerNoShow,
+      customerNoResponse,
+      requestTimeout,
+      quoteExpiry,
+      paymentFailure,
+      refundProcessing,
+      supportEscalation,
+      fraudFlagging,
+      kycReminders,
+      settlementCalculation,
+      analyticsEventCount,
       dispatchAttempts,
-      verificationRequests,
-      analyticsEvents,
+      enRouteRequests,
     ] = await Promise.all([
-      CustomerRequest.findAll({
-        attributes: [
-          'id',
-          'status',
-          'dispatchStatus',
-          'quoteStatus',
-          'paymentStatus',
-          'updatedAt',
-          'lastDispatchAt',
-          'acceptedAt',
-          'currentEtaMinutes',
-        ],
+      CustomerRequest.count({
+        where: {
+          status: ['ASSIGNED', 'ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'SERVICE_STARTED', 'SERVICE_COMPLETED'] as any
+        }
       }),
-      SupportTicket.findAll({
-        attributes: ['id', 'status', 'priority', 'createdAt', 'updatedAt'],
+      CustomerRequest.count({ where: { dispatchStatus: 'NO_SUPPLY' } as any }),
+      CustomerRequest.count({
+        where: {
+          status: ['REJECTED_BY_MECHANIC', 'SERVICE_CANCELLED'] as any
+        }
       }),
-      PayoutSettlement.findAll({
-        attributes: ['id', 'status', 'createdAt', 'processedAt'],
+      CustomerRequest.count({ where: { status: 'CANCELLED_BY_CUSTOMER' } as any }),
+      CustomerRequest.count({ where: { status: 'MECHANIC_NO_SHOW' } as any }),
+      CustomerRequest.count({ where: { status: 'CUSTOMER_NO_RESPONSE' } as any }),
+      CustomerRequest.count({
+        where: {
+          status: 'ASSIGNING',
+          lastDispatchAt: { [Op.lt]: oneHourAgo }
+        } as any
       }),
-      PaymentTransaction.findAll({
-        attributes: ['id', 'paymentStatus', 'createdAt', 'updatedAt'],
+      CustomerRequest.count({
+        where: {
+          quoteStatus: 'QUOTE_SUBMITTED',
+          updatedAt: { [Op.lt]: oneDayAgo }
+        } as any
+      }),
+      PaymentTransaction.count({ where: { paymentStatus: 'PAYMENT_FAILED' } as any }),
+      PaymentTransaction.count({
+        where: {
+          paymentStatus: ['REFUND_PENDING', 'REFUND_PROCESSING'] as any
+        }
+      }),
+      SupportTicket.count({
+        where: {
+          priority: ['HIGH', 'CRITICAL'] as any,
+          status: { [Op.notIn]: ['RESOLVED', 'CLOSED'] }
+        } as any
+      }),
+      SupportTicket.count({ where: { priority: 'CRITICAL' } as any }),
+      VerificationRequest.count({ where: { status: 'Pending' } as any }),
+      PayoutSettlement.count({
+        where: {
+          status: ['PENDING', 'PROCESSING'] as any
+        }
+      }),
+      AnalyticsEvent.count({
+        where: {
+          createdAt: { [Op.gte]: fortyEightHoursAgo },
+          [Op.or]: [
+            { eventType: { [Op.iLike]: 'REQUEST_%' } },
+            { eventType: { [Op.iLike]: 'PAYMENT_%' } },
+            { eventType: { [Op.iLike]: 'SUPPORT_%' } }
+          ]
+        } as any
       }),
       RequestDispatchAttempt.findAll({
-        attributes: ['id', 'customerRequestId', 'attemptStatus', 'createdAt'],
+        attributes: [
+          'customerRequestId',
+          [fn('COUNT', col('id')), 'attemptCount']
+        ],
+        group: ['customerRequestId'],
+        having: literal('COUNT("id") > 1'),
+        raw: true
       }),
-      VerificationRequest.findAll({
-        attributes: ['id', 'status', 'createdAt'],
-      }),
-      AnalyticsEvent.findAll({
-        attributes: ['id', 'eventType', 'createdAt'],
-        where: { createdAt: { [Op.gte]: hoursAgo(48) } },
-      }),
+      CustomerRequest.findAll({
+        attributes: ['acceptedAt', 'currentEtaMinutes'],
+        where: {
+          status: 'EN_ROUTE',
+          acceptedAt: { [Op.ne]: null },
+          currentEtaMinutes: { [Op.ne]: null }
+        } as any,
+        raw: true
+      })
     ]);
 
-    const requestMap = new Map<number, number>();
-    dispatchAttempts.forEach((attempt: any) => {
-      const key = Number(attempt.getDataValue('customerRequestId'));
-      requestMap.set(key, (requestMap.get(key) || 0) + 1);
-    });
-
-    const requestsPlain = requests.map((item: any) => item.get({ plain: true }));
-    const supportPlain = supportTickets.map((item: any) => item.get({ plain: true }));
-    const settlementsPlain = settlements.map((item: any) => item.get({ plain: true }));
-    const paymentPlain = paymentFailures.map((item: any) => item.get({ plain: true }));
-    const verificationPlain = verificationRequests.map((item: any) => item.get({ plain: true }));
-    const eventsPlain = analyticsEvents.map((item: any) => item.get({ plain: true }));
+    const slaBreaches = enRouteRequests.filter((item: any) => {
+      const acceptedAt = item.acceptedAt ? new Date(item.acceptedAt).getTime() : null;
+      const etaMinutes = item.currentEtaMinutes != null ? Number(item.currentEtaMinutes) : null;
+      if (!acceptedAt || etaMinutes == null) return false;
+      return acceptedAt < Date.now() - ((etaMinutes + 15) * 60 * 1000);
+    }).length;
 
     const metrics = {
-      partnerMatching: requestsPlain.filter((item) => ['ASSIGNED', 'ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'SERVICE_STARTED', 'SERVICE_COMPLETED'].includes(String(item.status))).length,
-      reDispatch: Array.from(requestMap.values()).filter((count) => count > 1).length,
-      requestTimeout: requestsPlain.filter((item) => String(item.status) === 'ASSIGNING' && item.lastDispatchAt && new Date(item.lastDispatchAt).getTime() < hoursAgo(1).getTime()).length,
-      noPartnerFound: requestsPlain.filter((item) => String(item.dispatchStatus) === 'NO_SUPPLY').length,
-      partnerCancellation: requestsPlain.filter((item) => ['REJECTED_BY_MECHANIC', 'SERVICE_CANCELLED'].includes(String(item.status))).length,
-      customerCancellation: requestsPlain.filter((item) => String(item.status) === 'CANCELLED_BY_CUSTOMER').length,
-      partnerNoShow: requestsPlain.filter((item) => String(item.status) === 'MECHANIC_NO_SHOW').length,
-      customerNoResponse: requestsPlain.filter((item) => String(item.status) === 'CUSTOMER_NO_RESPONSE').length,
-      paymentFailure: paymentPlain.filter((item) => String(item.paymentStatus) === 'PAYMENT_FAILED').length,
-      quoteExpiry: requestsPlain.filter((item) => String(item.quoteStatus) === 'QUOTE_SUBMITTED' && new Date(item.updatedAt).getTime() < hoursAgo(24).getTime()).length,
-      refundProcessing: paymentPlain.filter((item) => String(item.paymentStatus) === 'REFUND_PENDING' || String(item.paymentStatus) === 'REFUND_PROCESSING').length,
-      supportEscalation: supportPlain.filter((item) => ['HIGH', 'CRITICAL'].includes(String(item.priority)) && !['RESOLVED', 'CLOSED'].includes(String(item.status))).length,
-      fraudFlagging: supportPlain.filter((item) => String(item.priority) === 'CRITICAL').length,
-      kycReminders: verificationPlain.filter((item) => String(item.status) === 'Pending').length,
+      partnerMatching,
+      reDispatch: dispatchAttempts.length,
+      requestTimeout,
+      noPartnerFound,
+      partnerCancellation,
+      customerCancellation,
+      partnerNoShow,
+      customerNoResponse,
+      paymentFailure,
+      quoteExpiry,
+      refundProcessing,
+      supportEscalation,
+      fraudFlagging,
+      kycReminders,
       documentExpiry: 0,
-      settlementCalculation: settlementsPlain.filter((item) => ['PENDING', 'PROCESSING'].includes(String(item.status))).length,
-      notificationTriggering: eventsPlain.filter((item) => String(item.eventType).includes('REQUEST_') || String(item.eventType).includes('PAYMENT_') || String(item.eventType).includes('SUPPORT_')).length,
-      slaBreaches: requestsPlain.filter((item) => String(item.status) === 'EN_ROUTE' && item.acceptedAt && item.currentEtaMinutes != null && new Date(item.acceptedAt).getTime() < new Date(Date.now() - ((Number(item.currentEtaMinutes) + 15) * 60 * 1000)).getTime()).length,
+      settlementCalculation,
+      notificationTriggering: analyticsEventCount,
+      slaBreaches,
     };
 
-    res.json({
+    const payload = {
       generatedAt: new Date().toISOString(),
       metrics,
       recentSignals: [
@@ -119,7 +185,14 @@ export const getAdminAutomationOverview = async (req: AuthRequest, res: Response
         { label: 'Pending settlements', value: metrics.settlementCalculation, tone: metrics.settlementCalculation > 0 ? 'info' : 'normal' },
         { label: 'Quote expiry risk', value: metrics.quoteExpiry, tone: metrics.quoteExpiry > 0 ? 'warning' : 'normal' },
       ],
-    });
+    };
+
+    automationOverviewCache = {
+      expiresAt: Date.now() + AUTOMATION_OVERVIEW_CACHE_TTL_MS,
+      payload
+    };
+
+    res.json(payload);
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch automation overview');
   }

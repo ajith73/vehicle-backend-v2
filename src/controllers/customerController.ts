@@ -1,84 +1,27 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
 import { Op } from 'sequelize';
-import { CustomerProfile, CustomerRequest, CustomerSubscription, Mechanic, Otp, PaymentTransaction, RequestQuote, Role, ServiceType, SpecificService, SubscriptionPlan, SupportTicket, User, VehicleType, sequelize } from '../models';
+import { CustomerProfile, CustomerRequest, CustomerSubscription, Mechanic, Otp, PaymentTransaction, RequestAssignment, RequestDispatchAttempt, RequestQuote, RequestTimelineEvent, Role, ServiceType, SpecificService, SubscriptionPlan, SupportTicket, User, VehicleType } from '../models';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { handleControllerError } from '../utils/controller';
 import { sendOtpEmail } from '../utils/mail';
-import { enhancePhaseOneRequestCreation, loadRequestForOps } from './requestOperationsController';
-
-const JWT_SECRET = 'supersecret_mvp_key_change_me_in_prod';
-
-let customerProfileColumnsCache: Set<string> | null = null;
-
-const getCustomerProfileColumns = async () => {
-  if (customerProfileColumnsCache) {
-    return customerProfileColumnsCache;
-  }
-
-  const tableDescription = await sequelize.getQueryInterface().describeTable('CustomerProfiles');
-  customerProfileColumnsCache = new Set(Object.keys(tableDescription));
-  return customerProfileColumnsCache;
-};
-
-const createCustomerProfileDefaults = async (userId: number) => {
-  const columns = await getCustomerProfileColumns();
-  const defaults: Record<string, unknown> = { userId };
-
-  if (columns.has('displayName')) defaults.displayName = null;
-  if (columns.has('phone')) defaults.phone = null;
-  if (columns.has('lastLoginAt')) defaults.lastLoginAt = null;
-  if (columns.has('profilePicture')) defaults.profilePicture = null;
-  if (columns.has('savedVehicles')) defaults.savedVehicles = [];
-  if (columns.has('savedLocations')) defaults.savedLocations = [];
-  if (columns.has('prioritySupportEligible')) defaults.prioritySupportEligible = false;
-
-  return defaults;
-};
-
-const sanitizeCustomerProfilePayload = async (payload: Record<string, unknown>) => {
-  const columns = await getCustomerProfileColumns();
-  return Object.fromEntries(
-    Object.entries(payload).filter(([key, value]) => columns.has(key) && value !== undefined)
-  );
-};
-
-const normalizeCustomerProfile = (profile: any) => {
-  if (!profile) {
-    return {
-      displayName: null,
-      phone: null,
-      profilePicture: null,
-      savedVehicles: [],
-      savedLocations: [],
-      subscriptionStatus: null,
-      subscriptionTier: null,
-      subscriptionEndsAt: null,
-      prioritySupportEligible: false,
-      lastLoginAt: null
-    };
-  }
-
-  const plain = profile.toJSON ? profile.toJSON() : profile;
-  return {
-    ...plain,
-    savedVehicles: Array.isArray(plain.savedVehicles) ? plain.savedVehicles : [],
-    savedLocations: Array.isArray(plain.savedLocations) ? plain.savedLocations : [],
-    prioritySupportEligible: Boolean(plain.prioritySupportEligible)
-  };
-};
-
-const buildUsername = (email: string) => {
-  const base = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || 'customer';
-  return `${base}_${Math.floor(Math.random() * 100000)}`;
-};
-
-const issueTokens = (userId: number, role: string) => {
-  const token = jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: '15m' });
-  const refreshToken = jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: '30d' });
-  return { token, refreshToken, role };
-};
+import { enhancePhaseOneRequestCreation, loadRequestForOps } from './helpers/requestOperations.shared';
+import {
+  getCustomerNotificationsSnapshot,
+  getCustomerSupportTicketsSnapshot,
+  pushAdminSupportTicketsSnapshot,
+  pushCustomerNotificationsSnapshot,
+  pushCustomerSupportTicketsSnapshot
+} from '../lib/realtimeSnapshotService';
+import {
+  assignRequestToMechanic,
+  buildUsername,
+  createCustomerProfileDefaults,
+  findAutoAssignableMechanic,
+  issueTokens,
+  normalizeCustomerProfile,
+  sanitizeCustomerProfilePayload
+} from './helpers/customerController.helpers';
 
 export const sendCustomerOtp = async (req: Request, res: Response) => {
   try {
@@ -203,11 +146,13 @@ export const createCustomerRequest = async (req: AuthRequest, res: Response) => 
       addressText
     } = req.body;
 
+    let selectedMechanic: any = null;
     if (mechanicId) {
       const mechanic = await Mechanic.findByPk(mechanicId);
       if (!mechanic) {
         return res.status(404).json({ error: 'Selected mechanic was not found' });
       }
+      selectedMechanic = mechanic;
     }
 
     if (serviceTypeId) {
@@ -248,6 +193,48 @@ export const createCustomerRequest = async (req: AuthRequest, res: Response) => 
     });
 
     await enhancePhaseOneRequestCreation(requestRecord.getDataValue('id'));
+
+    if (selectedMechanic) {
+      await assignRequestToMechanic({
+        requestRecord,
+        mechanic: selectedMechanic,
+        actorUserId: req.user.userId,
+        actorType: 'CUSTOMER',
+        assignmentNote: 'Customer selected this partner during request creation.',
+        dispatchMode: 'CUSTOMER_SELECTED',
+        dispatchNote: 'Request sent to customer-selected mechanic.',
+        timelineNote: 'Customer selected a partner and dispatch started.'
+      });
+    } else {
+      const autoMechanic = await findAutoAssignableMechanic({
+        serviceTypeId: serviceTypeId ? Number(serviceTypeId) : null,
+        specificServiceId: specificServiceId ? Number(specificServiceId) : null,
+        vehicleTypeId: vehicleTypeId ? Number(vehicleTypeId) : null,
+        latitude: Number(latitude),
+        longitude: Number(longitude)
+      });
+
+      if (autoMechanic) {
+        await assignRequestToMechanic({
+          requestRecord,
+          mechanic: autoMechanic,
+          actorUserId: req.user.userId,
+          actorType: 'SYSTEM',
+          assignmentNote: 'Auto-assigned to the nearest eligible online partner.',
+          dispatchMode: 'AUTO_NEAREST',
+          dispatchNote: 'Request auto-dispatched to the nearest eligible online partner.',
+          timelineNote: 'System auto-assigned the nearest eligible online partner.'
+        });
+      } else {
+        await requestRecord.update({
+          dispatchStatus: 'NO_SUPPLY',
+          lastDispatchAt: new Date()
+        });
+
+        const { pushCustomerRequestSnapshot } = require('./realtimeController');
+        await pushCustomerRequestSnapshot(requestRecord.getDataValue('id'));
+      }
+    }
 
     const responseRecord = await CustomerRequest.findByPk(requestRecord.getDataValue('id'), {
       include: [
@@ -669,107 +656,16 @@ export const getCustomerNotifications = async (req: AuthRequest, res: Response) 
     if (!req.user?.userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
     const [profileRecord] = await CustomerProfile.findOrCreate({
       where: { userId: req.user.userId },
       defaults: await createCustomerProfileDefaults(req.user.userId) as any
     });
     const profile = normalizeCustomerProfile(profileRecord);
-
-    const requests = await CustomerRequest.findAll({
-      where: { customerUserId: req.user.userId },
-      include: [{ model: ServiceType, attributes: ['id', 'name'] }],
-      order: [['updatedAt', 'DESC']],
-      limit: 8
-    });
-
-    const supportTickets = await SupportTicket.findAll({
-      include: [{ model: CustomerRequest, attributes: ['id', 'customerUserId'] }],
-      order: [['updatedAt', 'DESC']],
-      limit: 8
-    });
-
-    const payments = await PaymentTransaction.findAll({
-      include: [{
-        model: CustomerRequest,
-        attributes: ['id', 'customerUserId'],
-        where: { customerUserId: req.user.userId }
-      }],
-      order: [['createdAt', 'DESC']],
-      limit: 8
-    });
-
-    const notifications: Array<Record<string, unknown>> = [];
-
-    requests.forEach((request: any) => {
-      const status = String(request.getDataValue('status') || '');
-      const serviceName = request.ServiceType?.name || request.getDataValue('issueSummary') || 'Service request';
-
-      if (['ASSIGNED', 'ACCEPTED', 'EN_ROUTE', 'ARRIVED', 'SERVICE_STARTED'].includes(status)) {
-        notifications.push({
-          id: `request-live-${request.getDataValue('id')}`,
-          type: 'ALERT',
-          title: `${serviceName} is in progress`,
-          message: `Your request REQ-${request.getDataValue('id')} is currently ${status.replace(/_/g, ' ').toLowerCase()}.`,
-          time: request.getDataValue('updatedAt'),
-          read: false
-        });
-      }
-
-      if (status === 'SERVICE_COMPLETED') {
-        notifications.push({
-          id: `request-complete-${request.getDataValue('id')}`,
-          type: 'SUCCESS',
-          title: 'Service completed',
-          message: `${serviceName} for REQ-${request.getDataValue('id')} was completed successfully.`,
-          time: request.getDataValue('updatedAt'),
-          read: true
-        });
-      }
-    });
-
-    payments.forEach((payment: any) => {
-      if (String(payment.getDataValue('paymentStatus')) === 'PAYMENT_COMPLETED') {
-        notifications.push({
-          id: `payment-${payment.getDataValue('id')}`,
-          type: 'SUCCESS',
-          title: 'Payment recorded',
-          message: `Payment of INR ${Number(payment.getDataValue('amount') || 0).toFixed(2)} has been recorded successfully.`,
-          time: payment.getDataValue('updatedAt') || payment.getDataValue('createdAt'),
-          read: true
-        });
-      }
-    });
-
-    supportTickets
-      .filter((ticket: any) => ticket.CustomerRequest?.customerUserId === req.user?.userId)
-      .forEach((ticket: any) => {
-        notifications.push({
-          id: `support-${ticket.getDataValue('id')}`,
-          type: ticket.getDataValue('status') === 'RESOLVED' ? 'SUCCESS' : 'WARNING',
-          title: ticket.getDataValue('subject') || 'Support ticket update',
-          message: `Support ticket TKT-${ticket.getDataValue('id')} is ${String(ticket.getDataValue('status') || 'OPEN').toLowerCase().replace(/_/g, ' ')}.`,
-          time: ticket.getDataValue('updatedAt') || ticket.getDataValue('createdAt'),
-          read: ticket.getDataValue('status') === 'RESOLVED'
-        });
-      });
-
-    if (!profile.phone) {
-      notifications.push({
-        id: 'profile-completion',
-        type: 'SYSTEM',
-        title: 'Complete your profile',
-        message: 'Add your phone number to speed up emergency roadside coordination.',
-        time: new Date().toISOString(),
-        read: false
-      });
+    if (!profile) {
+      return res.json([]);
     }
 
-    res.json(
-      notifications
-        .sort((left, right) => new Date(String(right.time)).getTime() - new Date(String(left.time)).getTime())
-        .slice(0, 20)
-    );
+    res.json(await getCustomerNotificationsSnapshot(req.user.userId));
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch customer notifications');
   }
@@ -781,16 +677,7 @@ export const listCustomerSupportTickets = async (req: AuthRequest, res: Response
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const tickets = await SupportTicket.findAll({
-      include: [{
-        model: CustomerRequest,
-        attributes: ['id', 'customerUserId', 'issueSummary', 'status', 'createdAt'],
-        where: { customerUserId: req.user.userId }
-      }],
-      order: [['updatedAt', 'DESC']]
-    });
-
-    res.json(tickets);
+    res.json(await getCustomerSupportTicketsSnapshot(req.user.userId));
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch customer support tickets');
   }
@@ -842,10 +729,20 @@ export const createCustomerSupportTicket = async (req: AuthRequest, res: Respons
 
     const requestWithTimeline = await loadRequestForOps(requestId);
     if (requestWithTimeline) {
+      await Promise.all([
+        pushCustomerSupportTicketsSnapshot(req.user.userId),
+        pushCustomerNotificationsSnapshot(req.user.userId),
+        pushAdminSupportTicketsSnapshot()
+      ]);
       res.status(201).json({ message: 'Support ticket created', ticket, request: requestWithTimeline });
       return;
     }
 
+    await Promise.all([
+      pushCustomerSupportTicketsSnapshot(req.user.userId),
+      pushCustomerNotificationsSnapshot(req.user.userId),
+      pushAdminSupportTicketsSnapshot()
+    ]);
     res.status(201).json({ message: 'Support ticket created', ticket });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to create customer support ticket');

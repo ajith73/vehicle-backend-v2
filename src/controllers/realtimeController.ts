@@ -11,7 +11,7 @@ import {
   subscribeMechanicJobDetail,
   subscribeMechanicJobList,
 } from '../lib/realtimeStreams';
-import { getMechanicForUser, getMechanicJobByIdForMechanic, getMechanicJobsForMechanicId, getRequestForCustomerUser } from './requestOperationsController';
+import { getMechanicForUser, getMechanicJobByIdForMechanic, getMechanicJobsForMechanicId, getRequestForCustomerUser } from './helpers/requestOperations.shared';
 
 const parsePositiveInt = (value: string | string[] | undefined) => {
   const normalized = Array.isArray(value) ? value[0] : value;

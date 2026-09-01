@@ -2,15 +2,18 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
+import http from 'http';
 import cors from 'cors';
 import { setupDatabase } from './seeders';
 import { routes } from './routes';
 import { errorHandler, notFoundHandler } from './middleware/errorMiddleware';
 import { requestLoggingMiddleware } from './middleware/requestLogging';
 import { logger, registerProcessErrorHandlers } from './lib/logger';
+import { initializeSocketServer } from './lib/socketServer';
 import {runTest} from './scripts/testDataVerification';
 
 const app = express();
+const server = http.createServer(app);
 registerProcessErrorHandlers();
 
 app.use(cors({ exposedHeaders: ['X-Total-Count'] }));
@@ -30,8 +33,9 @@ const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
   await setupDatabase();
+  initializeSocketServer(server);
   // await runTest();
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     logger.info('server_started', { port: Number(PORT) });
   });
 };
