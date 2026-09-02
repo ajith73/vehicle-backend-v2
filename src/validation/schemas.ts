@@ -7,7 +7,14 @@ import {
   objectField,
   optional,
   stringField,
+  type Validator,
 } from './schema';
+
+const optionalNonEmptyStringField = (): Validator<string | undefined> => (value, path) => {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string' && value.trim() === '') return undefined;
+  return stringField({ minLength: 1 })(value, path);
+};
 
 const MECHANIC_TYPES = [
   'Individual Mechanic',
@@ -209,6 +216,7 @@ export const customerRequestCancelSchema = objectField({
 export const mechanicJobStatusUpdateSchema = objectField({
   status: enumField(['EN_ROUTE', 'ARRIVED', 'SERVICE_STARTED', 'SERVICE_COMPLETED', 'CUSTOMER_NO_RESPONSE', 'MECHANIC_NO_SHOW', 'SERVICE_CANCELLED'] as const),
   notes: optional(stringField({ minLength: 1 })),
+  pin: optional(stringField({ minLength: 4 })),
   proofAssetUrl: optional(stringField({ minLength: 1 })),
   proofCaption: optional(stringField({ minLength: 1 }))
 });
@@ -251,7 +259,7 @@ export const customerSupportTicketCreateSchema = objectField({
   priority: optional(enumField(['LOW', 'NORMAL', 'HIGH', 'CRITICAL'] as const)),
   incidentType: optional(stringField({ minLength: 1 })),
   contactPreference: optional(stringField({ minLength: 1 })),
-  evidenceNotes: optional(stringField({ minLength: 1 }))
+  evidenceNotes: optionalNonEmptyStringField()
 });
 
 export const mechanicSupportTicketCreateSchema = objectField({
@@ -262,7 +270,7 @@ export const mechanicSupportTicketCreateSchema = objectField({
   priority: optional(enumField(['LOW', 'NORMAL', 'HIGH', 'CRITICAL'] as const)),
   incidentType: optional(stringField({ minLength: 1 })),
   contactPreference: optional(stringField({ minLength: 1 })),
-  evidenceNotes: optional(stringField({ minLength: 1 }))
+  evidenceNotes: optionalNonEmptyStringField()
 });
 
 export const adminSubscriptionPlanSchema = objectField({

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
     "build": "tsc",
+    "test:profile-picture": "npm run build && node --test dist/tests/customerProfilePicture.test.js",
     "prestart": "npm run build",
     "start": "node scripts/start.js",
     "migrate": "ts-node src/scripts/migrate.ts",

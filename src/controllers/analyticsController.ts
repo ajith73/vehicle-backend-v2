@@ -45,6 +45,8 @@ const ratio = (value: number, total: number) => {
   return Number(((value / total) * 100).toFixed(2));
 };
 
+const scoreFromRecommendation = (ratingRecommendation: number) => ratingRecommendation ? ratingRecommendation * 20 : 60;
+
 const percentile = (value: number, max: number) => {
   if (!max) return 0;
   return Number(Math.min(100, Math.max(0, (value / max) * 100)).toFixed(2));
@@ -550,34 +552,92 @@ export const getMechanicPerformanceInsights = async (req: AuthRequest, res: Resp
       return res.status(404).json({ error: 'Mechanic profile not found for this account' });
     }
 
-    const mechanicId = mechanic.getDataValue('id');
-    const metric = await PartnerPerformanceMetric.findOne({
-      where: { mechanicId },
-      order: [['metricDate', 'DESC']]
-    });
+    const mechanicId = Number(mechanic.getDataValue('id'));
+    const [assignmentRows, requestRows, reviewRows] = await Promise.all([
+      RequestAssignment.findAll({
+        where: { mechanicId } as any,
+        attributes: ['status'],
+        raw: true
+      }),
+      CustomerRequest.findAll({
+        where: { mechanicId } as any,
+        attributes: ['status', 'quoteStatus', 'paymentStatus', 'currentEtaMinutes'],
+        raw: true
+      }),
+      Review.findAll({
+        where: {
+          mechanicId,
+          status: 'Approved'
+        } as any,
+        attributes: ['ratingRecommendation'],
+        raw: true
+      })
+    ]);
 
-    if (!metric) {
-      const adminViewReq = { ...req } as AuthRequest;
-      await getPartnerPerformanceAnalytics(adminViewReq, {
-        json: () => undefined
-      } as unknown as Response);
-    }
+    const dispatchAttempts = assignmentRows.length;
+    const accepted = assignmentRows.filter((row: any) => row.status === 'ACCEPTED').length;
+    const rejected = assignmentRows.filter((row: any) => row.status === 'REJECTED_BY_MECHANIC').length;
+    const completed = requestRows.filter((row: any) => row.status === 'SERVICE_COMPLETED').length;
+    const quoteApproved = requestRows.filter((row: any) => row.quoteStatus === 'QUOTE_APPROVED').length;
+    const paymentLinked = requestRows.filter((row: any) => row.paymentStatus === 'PAYMENT_COMPLETED').length;
+    const etaSamples = requestRows
+      .map((row: any) => row.currentEtaMinutes)
+      .filter((value) => value != null && Number.isFinite(Number(value)))
+      .map((value) => Number(value));
+    const avgRecommendation = reviewRows.length > 0
+      ? reviewRows.reduce((sum: number, row: any) => sum + Number(row.ratingRecommendation || 0), 0) / reviewRows.length
+      : 0;
+    const averageEtaMinutes = etaSamples.length > 0
+      ? Number((etaSamples.reduce((sum: number, item: number) => sum + item, 0) / etaSamples.length).toFixed(2))
+      : null;
+    const totalOwnedRequests = requestRows.length;
+    const onlineHours = mechanic.getDataValue('isOnline') ? 8 : 2;
+
+    const metricPayload = {
+      mechanicId,
+      metricDate: todayDateOnly(),
+      onlineHours,
+      dispatchAttemptsReceived: dispatchAttempts,
+      acceptRate: ratio(accepted, dispatchAttempts),
+      rejectRate: ratio(rejected, dispatchAttempts),
+      timeoutRate: ratio(Math.max(dispatchAttempts - accepted - rejected, 0), dispatchAttempts),
+      completionRate: ratio(completed, Math.max(totalOwnedRequests, 1)),
+      quoteApprovalRate: ratio(quoteApproved, Math.max(totalOwnedRequests, 1)),
+      paymentLinkedCompletionRate: ratio(paymentLinked, Math.max(completed, 1)),
+      averageEtaMinutes,
+      score: Number((
+        (ratio(accepted, dispatchAttempts) * 0.3) +
+        (ratio(completed, Math.max(totalOwnedRequests, 1)) * 0.4) +
+        (ratio(paymentLinked, Math.max(completed, 1)) * 0.2) +
+        (scoreFromRecommendation(avgRecommendation) * 0.1)
+      ).toFixed(2)),
+      metadata: {
+        trusted: mechanic.getDataValue('isTrustedPartner'),
+        city: mechanic.getDataValue('city'),
+        lastActiveAt: mechanic.getDataValue('lastActiveAt')
+      }
+    };
 
     const latest = await PartnerPerformanceMetric.findOne({
-      where: { mechanicId },
-      order: [['metricDate', 'DESC']]
+      where: { mechanicId, metricDate: metricPayload.metricDate }
     });
+
+    if (latest) {
+      await latest.update(metricPayload);
+    } else {
+      await PartnerPerformanceMetric.create(metricPayload as any);
+    }
 
     res.json({
       mechanicId,
       mechanicName: mechanic.getDataValue('businessName') || mechanic.getDataValue('name'),
       city: mechanic.getDataValue('city'),
       trusted: mechanic.getDataValue('isTrustedPartner'),
-      score: latest?.getDataValue('score') || 0,
-      metrics: latest,
+      score: metricPayload.score,
+      metrics: metricPayload,
       improvements: [
-        (latest?.getDataValue('acceptRate') || 0) < 60 ? 'Improve job acceptance speed to raise dispatch rank.' : 'Acceptance is healthy for your current rank.',
-        (latest?.getDataValue('completionRate') || 0) < 70 ? 'Complete more assigned jobs to increase reliability score.' : 'Completion reliability is supporting your rank.',
+        (metricPayload.acceptRate || 0) < 60 ? 'Improve job acceptance speed to raise dispatch rank.' : 'Acceptance is healthy for your current rank.',
+        (metricPayload.completionRate || 0) < 70 ? 'Complete more assigned jobs to increase reliability score.' : 'Completion reliability is supporting your rank.',
         mechanic.getDataValue('isTrustedPartner') ? 'Trusted partner status is boosting your visibility.' : 'Trusted partner status can further improve your ranking.',
       ]
     });

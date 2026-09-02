@@ -1,6 +1,6 @@
 import { Response } from 'express';
 import { Op } from 'sequelize';
-import { ActivityLog, CustomerProfile, CustomerRequest, DispatchOverride, Mechanic, MechanicLiveState, PaymentTransaction, PayoutSettlement, RealtimeEventLog, RequestAssignment, RequestCancellation, RequestDispatchAttempt, RequestInternalNote, RequestProofAsset, RequestQuote, RequestQuoteLineItem, RequestTimelineEvent, ServiceType, SpecificService, SupportTicket, User, VehicleType, sequelize } from '../models';
+import { ActivityLog, CustomerProfile, CustomerRequest, DispatchOverride, Mechanic, MechanicLiveState, PartnerEarning, PaymentTransaction, PayoutSettlement, RealtimeEventLog, RequestAssignment, RequestCancellation, RequestDispatchAttempt, RequestInternalNote, RequestProofAsset, RequestQuote, RequestQuoteLineItem, RequestTimelineEvent, ServiceType, SpecificService, SupportTicket, User, VehicleType, sequelize } from '../models';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { handleControllerError } from '../utils/controller';
 import { PAYMENT_STATUSES, QUOTE_STATUSES, REQUEST_STATUSES } from '../constants/requestLifecycle';
@@ -14,6 +14,7 @@ import {
   pushAffectedRequestSideSnapshots,
   pushCustomerNotificationsSnapshot,
   pushCustomerSupportTicketsSnapshot,
+  pushMechanicEarningsSnapshot,
   pushMechanicNotificationsSnapshot,
   pushMechanicSupportTicketsSnapshot
 } from '../lib/realtimeSnapshotService';
@@ -22,6 +23,9 @@ const MECHANIC_RESPONSE_STATUSES = new Set([
   REQUEST_STATUSES.ACCEPTED,
   REQUEST_STATUSES.REJECTED_BY_MECHANIC,
 ]);
+
+const generateCompletionPin = () => String(Math.floor(1000 + Math.random() * 9000));
+const toNonNegativeMoney = (value: unknown) => Math.max(0, Number(toMoney(value)));
 
 export const loadRequestForOps = (id: number) =>
   CustomerRequest.findByPk(id, {
@@ -988,6 +992,20 @@ export const updateMechanicJobLifecycle = async (req: AuthRequest, res: Response
       return res.status(400).json({ error: `Invalid transition from ${currentStatus} to ${nextStatus}` });
     }
 
+    if (nextStatus === REQUEST_STATUSES.SERVICE_COMPLETED) {
+      const submittedPin = String(req.body.pin || '').trim();
+      const expectedPin = String(requestRecord.getDataValue('completionPin') || '').trim();
+      if (!expectedPin) {
+        return res.status(400).json({ error: 'Customer completion OTP is not ready yet. Ask the customer to reopen the request screen.' });
+      }
+      if (!/^\d{4}$/.test(submittedPin)) {
+        return res.status(400).json({ error: 'Enter the valid 4-digit customer completion OTP' });
+      }
+      if (submittedPin !== expectedPin) {
+        return res.status(400).json({ error: 'The customer completion OTP is incorrect' });
+      }
+    }
+
     await transitionRequestStatus(requestRecord, {
       toStatus: nextStatus,
       actorType: 'MECHANIC',
@@ -1017,7 +1035,19 @@ export const updateMechanicJobLifecycle = async (req: AuthRequest, res: Response
 
     await requestRecord.update({
       currentEtaMinutes: nextEta,
-      lastLocationUpdateAt: new Date()
+      lastLocationUpdateAt: new Date(),
+      ...(nextStatus === REQUEST_STATUSES.SERVICE_STARTED
+        ? {
+            completionPin: requestRecord.getDataValue('completionPin') || generateCompletionPin(),
+            completionPinGeneratedAt: requestRecord.getDataValue('completionPinGeneratedAt') || new Date(),
+            completionPinVerifiedAt: null
+          }
+        : {}),
+      ...(nextStatus === REQUEST_STATUSES.SERVICE_COMPLETED
+        ? {
+            completionPinVerifiedAt: new Date()
+          }
+        : {})
     });
 
     await upsertMechanicLiveState(mechanic.getDataValue('id'), {
@@ -1128,15 +1158,17 @@ export const goMechanicOnline = async (req: AuthRequest, res: Response) => {
       staleAfterAt: new Date(now.getTime() + 5 * 60 * 1000)
     });
 
-    await appendRealtimeEvent({
+    res.json({ message: 'Partner is now online', mechanic, liveState });
+
+    void appendRealtimeEvent({
       mechanicId: mechanic.getDataValue('id'),
       actorUserId: req.user.userId,
       channel: 'MECHANIC_DISPATCH',
       eventType: 'PARTNER_ONLINE',
       payload: { availabilityState }
+    }).catch((streamError) => {
+      console.error('Failed to publish partner online realtime updates', streamError);
     });
-
-    res.json({ message: 'Partner is now online', mechanic, liveState });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to set mechanic online');
   }
@@ -1168,15 +1200,17 @@ export const goMechanicOffline = async (req: AuthRequest, res: Response) => {
       metadata: { notes: req.body.notes || null }
     });
 
-    await appendRealtimeEvent({
+    res.json({ message: 'Partner is now offline', mechanic, liveState });
+
+    void appendRealtimeEvent({
       mechanicId: mechanic.getDataValue('id'),
       actorUserId: req.user.userId,
       channel: 'MECHANIC_DISPATCH',
       eventType: 'PARTNER_OFFLINE',
       payload: { notes: req.body.notes || null }
+    }).catch((streamError) => {
+      console.error('Failed to publish partner offline realtime updates', streamError);
     });
-
-    res.json({ message: 'Partner is now offline', mechanic, liveState });
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to set mechanic offline');
   }
@@ -1653,6 +1687,36 @@ export const initiateCustomerPayment = async (req: AuthRequest, res: Response) =
       order: [['createdAt', 'DESC']]
     });
     if (existingPayment && existingPayment.getDataValue('paymentStatus') === PAYMENT_STATUSES.COMPLETED) {
+      const mechanicId = Number(requestRecord.getDataValue('mechanicId') || 0);
+      let backfilledEarning = false;
+      if (mechanicId > 0) {
+        const grossAmount = toNonNegativeMoney(existingPayment.getDataValue('amount'));
+        const platformFee = toNonNegativeMoney(quote.getDataValue('feeAmount'));
+        const netAmount = Math.max(0, Number((grossAmount - platformFee).toFixed(2)));
+        const existingEarning = await PartnerEarning.findOne({ where: { customerRequestId: requestId } });
+        if (!existingEarning) {
+          await PartnerEarning.create({
+            mechanicId,
+            customerRequestId: requestId,
+            paymentTransactionId: existingPayment.getDataValue('id'),
+            grossAmount,
+            platformFeeDeduction: platformFee,
+            netEarningAmount: netAmount,
+            currencyCode: String(existingPayment.getDataValue('currencyCode') || 'INR'),
+            status: 'PENDING_SETTLEMENT',
+            notes: 'Backfilled from an already completed customer payment.'
+          });
+          backfilledEarning = true;
+        }
+
+        if (backfilledEarning) {
+          const mechanic = await Mechanic.findByPk(mechanicId, { attributes: ['id', 'createdById'] });
+          await Promise.all([
+            pushMechanicEarningsSnapshot(mechanicId),
+            mechanic ? pushMechanicNotificationsSnapshot(mechanicId, Number(mechanic.getDataValue('createdById') || 0)) : Promise.resolve()
+          ]);
+        }
+      }
       return res.json({ message: 'Payment already recorded', payment: existingPayment });
     }
 
@@ -1683,6 +1747,47 @@ export const initiateCustomerPayment = async (req: AuthRequest, res: Response) =
       paymentStatus,
       finalAmount: amount
     });
+
+    if (!isMockFailure) {
+      const mechanicId = Number(requestRecord.getDataValue('mechanicId') || 0);
+      if (mechanicId > 0) {
+        const grossAmount = amount;
+        const platformFee = toNonNegativeMoney(quote.getDataValue('feeAmount'));
+        const netAmount = Math.max(0, Number((grossAmount - platformFee).toFixed(2)));
+        const existingEarning = await PartnerEarning.findOne({ where: { customerRequestId: requestId } });
+
+        if (existingEarning) {
+          await existingEarning.update({
+            mechanicId,
+            paymentTransactionId: payment.getDataValue('id'),
+            grossAmount,
+            platformFeeDeduction: platformFee,
+            netEarningAmount: netAmount,
+            currencyCode: String(payment.getDataValue('currencyCode') || 'INR'),
+            status: 'PENDING_SETTLEMENT',
+            notes: 'Created from customer payment completion.'
+          });
+        } else {
+          await PartnerEarning.create({
+            mechanicId,
+            customerRequestId: requestId,
+            paymentTransactionId: payment.getDataValue('id'),
+            grossAmount,
+            platformFeeDeduction: platformFee,
+            netEarningAmount: netAmount,
+            currencyCode: String(payment.getDataValue('currencyCode') || 'INR'),
+            status: 'PENDING_SETTLEMENT',
+            notes: 'Created from customer payment completion.'
+          });
+        }
+
+        const mechanic = await Mechanic.findByPk(mechanicId, { attributes: ['id', 'createdById'] });
+        await Promise.all([
+          pushMechanicEarningsSnapshot(mechanicId),
+          mechanic ? pushMechanicNotificationsSnapshot(mechanicId, Number(mechanic.getDataValue('createdById') || 0)) : Promise.resolve()
+        ]);
+      }
+    }
 
     await appendTimelineEvent({
       customerRequestId: requestId,

@@ -1,6 +1,6 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
-import { PartnerEarning, PayoutSettlement, Mechanic, CustomerRequest, PaymentTransaction } from '../models';
+import { PartnerEarning, PayoutSettlement, Mechanic, CustomerRequest, PaymentTransaction, RequestQuote } from '../models';
 import { handleControllerError } from '../utils/controller';
 import {
   getAdminSettlementsSnapshot,
@@ -9,6 +9,62 @@ import {
   pushMechanicEarningsSnapshot,
   pushMechanicNotificationsSnapshot
 } from '../lib/realtimeSnapshotService';
+
+const toMoney = (value: unknown) => Number(Number(value || 0).toFixed(2));
+
+const syncMissingMechanicEarnings = async (mechanicId: number) => {
+  const paidRequests = await CustomerRequest.findAll({
+    where: {
+      mechanicId,
+      paymentStatus: 'PAYMENT_COMPLETED'
+    } as any,
+    attributes: ['id'],
+    raw: true
+  });
+
+  for (const requestRow of paidRequests) {
+    const requestId = Number((requestRow as any).id || 0);
+    if (!requestId) {
+      continue;
+    }
+
+    const existing = await PartnerEarning.findOne({ where: { customerRequestId: requestId } });
+    if (existing) {
+      continue;
+    }
+
+    const [payment, quote] = await Promise.all([
+      PaymentTransaction.findOne({
+        where: { customerRequestId: requestId, paymentStatus: 'PAYMENT_COMPLETED' } as any,
+        order: [['createdAt', 'DESC']]
+      }),
+      RequestQuote.findOne({
+        where: { customerRequestId: requestId },
+        order: [['createdAt', 'DESC']]
+      })
+    ]);
+
+    if (!payment) {
+      continue;
+    }
+
+    const grossAmount = toMoney(payment.getDataValue('amount'));
+    const platformFeeDeduction = toMoney(quote?.getDataValue('feeAmount'));
+    const netEarningAmount = Math.max(0, Number((grossAmount - platformFeeDeduction).toFixed(2)));
+
+    await PartnerEarning.create({
+      mechanicId,
+      customerRequestId: requestId,
+      paymentTransactionId: payment.getDataValue('id'),
+      grossAmount,
+      platformFeeDeduction,
+      netEarningAmount,
+      currencyCode: String(payment.getDataValue('currencyCode') || 'INR'),
+      status: 'PENDING_SETTLEMENT',
+      notes: 'Backfilled automatically from completed payment.'
+    });
+  }
+};
 
 export const getMechanicEarnings = async (req: AuthRequest, res: Response) => {
   try {
@@ -20,7 +76,9 @@ export const getMechanicEarnings = async (req: AuthRequest, res: Response) => {
     if (!mechanic) {
       return res.status(404).json({ error: 'Mechanic profile not found' });
     }
-    res.json(await getMechanicEarningsSnapshot(Number(mechanic.getDataValue('id'))));
+    const mechanicId = Number(mechanic.getDataValue('id'));
+    await syncMissingMechanicEarnings(mechanicId);
+    res.json(await getMechanicEarningsSnapshot(mechanicId));
   } catch (error) {
     handleControllerError(req, res, error, 'Failed to fetch mechanic earnings');
   }

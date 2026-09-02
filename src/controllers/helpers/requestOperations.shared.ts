@@ -276,8 +276,26 @@ export const parseMechanicId = (value: unknown) => {
 
 export const getMechanicForUser = async (userId: number) => Mechanic.findOne({ where: { createdById: userId } });
 
+const sanitizeMechanicRequestPayload = (request: any) => {
+  if (!request) return null;
+  const json = typeof request.toJSON === 'function' ? request.toJSON() : { ...request };
+  delete json.completionPin;
+  delete json.completionPinGeneratedAt;
+  delete json.completionPinVerifiedAt;
+  return json;
+};
+
+const sanitizeCustomerRequestPayload = (request: any) => {
+  if (!request) return null;
+  const json = typeof request.toJSON === 'function' ? request.toJSON() : { ...request };
+  if (json.status !== REQUEST_STATUSES.SERVICE_STARTED) {
+    delete json.completionPin;
+  }
+  return json;
+};
+
 export const getMechanicJobsForMechanicId = async (mechanicId: number) =>
-  CustomerRequest.findAll({
+  (await CustomerRequest.findAll({
     where: {
       mechanicId,
       status: {
@@ -309,14 +327,14 @@ export const getMechanicJobsForMechanicId = async (mechanicId: number) =>
       }
     ],
     order: [['createdAt', 'DESC']]
-  });
+  })).map(sanitizeMechanicRequestPayload);
 
 export const getMechanicJobByIdForMechanic = async (requestId: number, mechanicId: number) => {
   const requestRecord = await loadRequestForOps(requestId);
   if (!requestRecord || requestRecord.getDataValue('mechanicId') !== mechanicId) {
     return null;
   }
-  return requestRecord;
+  return sanitizeMechanicRequestPayload(requestRecord);
 };
 
 export const getRequestForCustomerUser = async (requestId: number, customerUserId: number) => {
@@ -324,7 +342,19 @@ export const getRequestForCustomerUser = async (requestId: number, customerUserI
   if (!requestRecord || requestRecord.getDataValue('customerUserId') !== customerUserId) {
     return null;
   }
-  return requestRecord;
+
+  if (
+    requestRecord.getDataValue('status') === REQUEST_STATUSES.SERVICE_STARTED &&
+    !requestRecord.getDataValue('completionPin')
+  ) {
+    await requestRecord.update({
+      completionPin: String(Math.floor(1000 + Math.random() * 9000)),
+      completionPinGeneratedAt: requestRecord.getDataValue('completionPinGeneratedAt') || new Date(),
+      completionPinVerifiedAt: null
+    });
+  }
+
+  return sanitizeCustomerRequestPayload(requestRecord);
 };
 
 export const toMoney = (value: unknown) => {

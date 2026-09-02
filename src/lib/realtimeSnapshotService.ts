@@ -29,6 +29,10 @@ const liveAdminStatuses = [
 ];
 
 const toNumber = (value: unknown) => Number(value || 0);
+const MECHANIC_NOTIFICATION_CACHE_TTL_MS = 10000;
+const mechanicNotificationCache = new Map<string, { expiresAt: number; data: Array<Record<string, unknown>> }>();
+
+const getMechanicNotificationCacheKey = (mechanicId: number, userId: number) => `${mechanicId}:${userId}`;
 
 export const findMechanicForUserId = async (userId: number) =>
   Mechanic.findOne({ where: { createdById: userId } });
@@ -207,6 +211,12 @@ export const getCustomerSupportTicketsSnapshot = async (userId: number) =>
   });
 
 export const getMechanicNotificationsSnapshot = async (mechanicId: number, userId: number) => {
+  const cacheKey = getMechanicNotificationCacheKey(mechanicId, userId);
+  const cached = mechanicNotificationCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
   const [requests, tickets, settlements] = await Promise.all([
     CustomerRequest.findAll({
       where: { mechanicId } as any,
@@ -268,9 +278,16 @@ export const getMechanicNotificationsSnapshot = async (mechanicId: number, userI
     source: 'settlement'
   }));
 
-  return [...requestNotifications, ...supportNotifications, ...settlementNotifications]
+  const snapshot = [...requestNotifications, ...supportNotifications, ...settlementNotifications]
     .sort((left, right) => new Date(String(right.time)).getTime() - new Date(String(left.time)).getTime())
     .slice(0, 30);
+
+  mechanicNotificationCache.set(cacheKey, {
+    expiresAt: Date.now() + MECHANIC_NOTIFICATION_CACHE_TTL_MS,
+    data: snapshot
+  });
+
+  return snapshot;
 };
 
 export const getMechanicSupportTicketsSnapshot = async (mechanicId: number, userId: number) => {
@@ -443,6 +460,7 @@ export const pushCustomerSupportTicketsSnapshot = async (userId: number) => {
 };
 
 export const pushMechanicNotificationsSnapshot = async (mechanicId: number, userId: number) => {
+  mechanicNotificationCache.delete(getMechanicNotificationCacheKey(mechanicId, userId));
   const snapshot = await getMechanicNotificationsSnapshot(mechanicId, userId);
   emitSocketRoomEvent(socketRooms.mechanicNotificationsRoom(mechanicId), 'mechanic:notifications:update', snapshot);
 };

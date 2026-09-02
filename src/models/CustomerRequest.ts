@@ -82,6 +82,18 @@ CustomerRequest.init(
       type: DataTypes.DATE,
       allowNull: true,
     },
+    completionPin: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    completionPinGeneratedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    completionPinVerifiedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
     pricingMode: {
       type: DataTypes.STRING,
       allowNull: true,

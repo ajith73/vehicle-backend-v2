@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import { DataTypes } from 'sequelize';
 import {
   Mechanic,
   RequestAssignment,
@@ -15,12 +16,63 @@ const JWT_SECRET = process.env.JWT_SECRET || 'supersecret_mvp_key_change_me_in_p
 
 let customerProfileColumnsCache: Set<string> | null = null;
 
+export const resetCustomerProfileColumnsCacheForTests = () => {
+  customerProfileColumnsCache = null;
+};
+
+const REQUIRED_CUSTOMER_PROFILE_COLUMNS: Array<{ name: string; definition: Record<string, unknown> }> = [
+  {
+    name: 'profilePicture',
+    definition: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    }
+  },
+  {
+    name: 'savedVehicles',
+    definition: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: []
+    }
+  },
+  {
+    name: 'savedLocations',
+    definition: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: []
+    }
+  },
+  {
+    name: 'prioritySupportEligible',
+    definition: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false
+    }
+  }
+];
+
+const ensureCustomerProfileColumns = async () => {
+  const queryInterface = sequelize.getQueryInterface();
+  const tableDescription = await queryInterface.describeTable('CustomerProfiles');
+
+  for (const column of REQUIRED_CUSTOMER_PROFILE_COLUMNS) {
+    if (!tableDescription[column.name]) {
+      await queryInterface.addColumn('CustomerProfiles', column.name, column.definition as any);
+    }
+  }
+
+  return queryInterface.describeTable('CustomerProfiles');
+};
+
 export const getCustomerProfileColumns = async () => {
   if (customerProfileColumnsCache) {
     return customerProfileColumnsCache;
   }
 
-  const tableDescription = await sequelize.getQueryInterface().describeTable('CustomerProfiles');
+  const tableDescription = await ensureCustomerProfileColumns();
   customerProfileColumnsCache = new Set(Object.keys(tableDescription));
   return customerProfileColumnsCache;
 };

@@ -1430,3 +1430,36 @@ export const addCustomerProfilePictureMigration: Migration = {
 };
 
 migrations.push(addCustomerProfilePictureMigration);
+
+export const addCustomerRequestCompletionPinMigration: Migration = {
+  name: 'add-customer-request-completion-pin',
+  up: async (queryInterface) => {
+    const tableInfo = await queryInterface.describeTable('CustomerRequests').catch(() => null);
+    if (!tableInfo) {
+      return;
+    }
+
+    if (!tableInfo.completionPin) {
+      await queryInterface.addColumn('CustomerRequests', 'completionPin', {
+        type: DataTypes.STRING,
+        allowNull: true
+      });
+    }
+
+    if (!tableInfo.completionPinGeneratedAt) {
+      await queryInterface.addColumn('CustomerRequests', 'completionPinGeneratedAt', {
+        type: DataTypes.DATE,
+        allowNull: true
+      });
+    }
+
+    if (!tableInfo.completionPinVerifiedAt) {
+      await queryInterface.addColumn('CustomerRequests', 'completionPinVerifiedAt', {
+        type: DataTypes.DATE,
+        allowNull: true
+      });
+    }
+  }
+};
+
+migrations.push(addCustomerRequestCompletionPinMigration);
